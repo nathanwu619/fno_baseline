@@ -1,0 +1,72 @@
+import numpy as np
+import torch
+import torch.fft as fft
+import os
+# libraries 
+torch.set_default_dtype(torch.float32) # all tensors are set to 32 bit precision
+
+# parameters
+nu = 1e-3        # viscosity set to 10^-3
+delta_t = 0.01   # time step
+N = 64           # grid size is 64x64
+L = 2 * np.pi    # domain size, 0 to 2pi which is periodic for FFT
+
+# setting wave numbers
+k1 = torch.fft.fftfreq(N, d=L/N) * 2 * np.pi # k is frequency of wave in space wavenumbers used to compute derivatives in spectral space. scaled by 2pi since frequency is returned in cycles. Angular frequency needed.
+k2 = torch.fft.fftfreq(N, d=L/N) * 2 * np.pi
+k1, k2 = torch.meshgrid(k1, k2, indexing='ij') # forms a 2d coordinate grid for kx and ky
+k_squared = k1**2 + k2**2 # k^2 = kx^2 + ky^2 needed for laplacian and inverse laplacian 
+k_squared[0, 0] = 1.0  # avoid division by zero
+
+inv_laplace = -1.0 / k_squared # defines inverse laplacian in spectral space
+inv_laplace[0, 0] = 0.0 # allows you to go back from vorticity to stream function
+
+def navier_stokes_step(w):
+    w_hat = fft.fft2(w) # computes the 2D fft of vorticity. needed for spectral computation
+    psi_hat = w_hat * inv_laplace #  gets stream function. stream function can be used to compute velocity of fluid
+
+    # compute velocity field: u = -dpsi/dy, v = dpsi/dx
+    u = fft.ifft2(1j * k2 * psi_hat).real # u is how fast fluid moves left and right
+    v = -fft.ifft2(1j * k1 * psi_hat).real # v is how fast fluid moves up and down
+    # essentially takes derivative of stream function using FFT 
+
+    # compute advection (how fluid carries stuff around) u (x and y) * delta w. dot product of velocity and gradient [dw_dx and dw_dy] ofvorticity
+    dw_dx = fft.ifft2(1j * k1 * w_hat).real # computes how vorticity is changing in x
+    dw_dy = fft.ifft2(1j * k2 * w_hat).real # computes how vorticity is changing in y
+    nonlin = u * dw_dx + v * dw_dy # advection is the nonlinear term. this is the dot product of velocity vector and change in vorticity
+
+    nonlin_hat = fft.fft2(nonlin) # transforms nonlin to frequency space
+
+    # time integration. w_hat is current vorticity 
+    w_hat_new = (w_hat - delta_t * nonlin_hat) * torch.exp(-nu * k_squared * delta_t)
+    # subtracting advection to update vorticity which approximates change in vorticity due to self-advection
+    # then multiplies by viscosity factor in fourier space. applies viscous diffusion. # damps out waves in overall fluid pattern based on wavenumber (how many reipples that wave has across the space) sharper wave, faster disappears
+    w_new = fft.ifft2(w_hat_new).real # takes updated vorticity and transforms to real space
+    return w_new # returns new vorticity field after one step forward in time
+
+no_samples = 10000
+no_test = 100 # number of samples to use for testing
+steps_per_sample = 10 # lets vorticity evolve into something more meaningful and realistic before saving it
+
+# create and empty tensor to hold samples
+synthetic_data = torch.zeros((no_samples, N, N), dtype=torch.float32)
+
+for i in range(no_samples):
+    w = torch.randn(N, N) # start w random initial vorticity for each sample
+
+    for _ in range(steps_per_sample):
+        w = navier_stokes_step(w)
+    
+    synthetic_data[i] = w # stores final vorticity field as a data sample
+
+indices = torch.randperm(no_samples)[:no_test] # shuffle and grab first 100 indices
+test_data = synthetic_data[indices] # extract corresponding vorticity fields
+
+print("Synthetic dataset shape:", synthetic_data.shape)
+print("Test set shape:", test_data.shape)
+
+print("Saving to:", os.path.join(os.getcwd(), "synthetic_data_ns2d"))
+os.makedirs("synthetic_data_ns2d", exist_ok=True)
+torch.save(synthetic_data, 'synthetic_data_ns2d/synthetic_data.pt')
+torch.save(test_data, 'synthetic_data_ns2d/test_data.pt')
+print("Files saved to synthetic_data_ns2d/")
