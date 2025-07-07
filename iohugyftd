@@ -1,0 +1,159 @@
+import torch
+import torch.nn as nn
+import torch.fft as fft
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, TensorDataset
+import matplotlib.pyplot as plt
+import time
+import pandas as pd
+import os
+
+# === FIXED PARAMETERS ===
+base_config = {
+    'modes': 8,
+    'width': 32,
+    'epochs': 3,
+    'batch_size': 4,
+    'dt': 0.01,
+    'nu': 1e-3,
+    'grid_size': 32,
+    'train_samples': 500,
+    'val_samples': 100
+}
+
+# === LOAD DATA ===
+data = torch.load('synthetic_data_ns2d/synthetic_data.pt')
+train_data = data[:base_config['train_samples']]
+val_data = data[base_config['train_samples']:base_config['train_samples']+base_config['val_samples']]
+x_train, y_train = train_data[:, 0], train_data[:, 1]
+x_val, y_val = val_data[:, 0], val_data[:, 1]
+
+# === MODEL ARCHITECTURE ===
+class SpectralConv2d(nn.Module):
+    def __init__(self, in_channels, out_channels, modes):
+        super().__init__()
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.modes = modes
+        self.scale = 1 / (in_channels * out_channels)
+        self.weights = nn.Parameter(
+            self.scale * torch.rand(in_channels, out_channels, modes, modes, dtype=torch.cfloat)
+        )
+
+    def compl_mul2d(self, input, weights):
+        return torch.einsum("bixy, ioxy -> boxy", input, weights)
+
+    def forward(self, x):
+        B, C, H, W = x.shape
+        if self.modes > H or self.modes > W:
+            raise ValueError(f"modes={self.modes} is larger than input resolution {H}x{W}")
+        x_ft = fft.fft2(x, norm="ortho")
+        out_ft = torch.zeros(B, self.out_channels, H, W, dtype=torch.cfloat, device=x.device)
+        out_ft[:, :, :self.modes, :self.modes] = self.compl_mul2d(
+            x_ft[:, :, :self.modes, :self.modes], self.weights
+        )
+        return fft.ifft2(out_ft, norm="ortho").real
+
+class FNO2D(nn.Module):
+    def __init__(self, modes, width):
+        super().__init__()
+        self.width = width
+        self.fc0 = nn.Linear(1, width)
+        self.conv1 = SpectralConv2d(width, width, modes)
+        self.conv2 = SpectralConv2d(width, width, modes)
+        self.w1 = nn.Conv2d(width, width, 1)
+        self.w2 = nn.Conv2d(width, width, 1)
+        self.fc1 = nn.Linear(width, 128)
+        self.fc2 = nn.Linear(128, 1)
+
+    def forward(self, x):
+        x = x.unsqueeze(-1)
+        x = self.fc0(x).permute(0, 3, 1, 2)
+        x = F.gelu(self.conv1(x) + self.w1(x))
+        x = F.gelu(self.conv2(x) + self.w2(x))
+        x = x.permute(0, 2, 3, 1)
+        x = F.gelu(self.fc1(x))
+        return self.fc2(x).squeeze(-1)
+
+# === SWEEP FUNCTION ===
+def sweep_param(param_name, param_values):
+    results = []
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+    for val in param_values:
+        if param_name == 'modes' and val > base_config['grid_size']:
+            print(f"Skipping modes={val} because it exceeds grid size {base_config['grid_size']}")
+            continue
+
+        config = base_config.copy()
+        config[param_name] = val
+        print(f"\nTraining with {param_name} = {val}")
+
+        model = FNO2D(config['modes'], config['width']).to(device)
+        optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+        loss_fn = nn.MSELoss()
+        train_loader = DataLoader(TensorDataset(x_train, y_train), batch_size=config['batch_size'], shuffle=True)
+        val_loader = DataLoader(TensorDataset(x_val, y_val), batch_size=config['batch_size'])
+
+        for ep in range(config['epochs']):
+            model.train()
+            for xb, yb in train_loader:
+                xb, yb = xb.to(device), yb.to(device)
+                pred = model(xb)
+                loss = loss_fn(pred, yb)
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+
+        model.eval()
+        with torch.no_grad():
+            xb, yb = next(iter(val_loader))
+            xb, yb = xb.to(device), yb.to(device)
+            start = time.time()
+            y_pred = model(xb)
+            infer_time = (time.time() - start) / len(xb)
+            rel_error = (torch.norm(y_pred - yb) / torch.norm(yb)).item()
+
+        results.append((val, rel_error, infer_time))
+    return results
+
+# === PARAMETER SWEEPS ===
+sweep_settings = {
+    'modes': list(range(4, 33, 4)),
+    'width': list(range(16, 129, 16)),
+    'batch_size': [2, 4, 8, 16],
+    'dt': [0.001, 0.005, 0.01, 0.02, 0.04],
+    'nu': [1e-5, 1e-4, 1e-3, 1e-2],
+    'epochs': [1, 2, 3, 5, 7, 10]
+}
+
+os.makedirs("sweep_results", exist_ok=True)
+
+for param_name, param_values in sweep_settings.items():
+    print(f"\n===== Sweeping {param_name} =====")
+    results = sweep_param(param_name, param_values)
+    df = pd.DataFrame(results, columns=[param_name, 'Relative Error', 'Inference Time (s)'])
+
+    # Save results to CSV
+    csv_path = f"sweep_results/sweep_{param_name}.csv"
+    df.to_csv(csv_path, index=False)
+    print(f"Saved results to {csv_path}")
+
+    # Plotting
+    fig, ax1 = plt.subplots(figsize=(8, 5))
+    color = 'tab:blue'
+    ax1.set_xlabel(param_name)
+    ax1.set_ylabel('Relative Error', color=color)
+    ax1.plot(df[param_name], df['Relative Error'], marker='o', color=color)
+    ax1.tick_params(axis='y', labelcolor=color)
+
+    ax2 = ax1.twinx()
+    color = 'tab:orange'
+    ax2.set_ylabel('Inference Time (s)', color=color)
+    ax2.plot(df[param_name], df['Inference Time (s)'], marker='s', color=color)
+    ax2.tick_params(axis='y', labelcolor=color)
+
+    plt.title(f'Sweep of {param_name} vs Accuracy and Inference Time')
+    plt.grid(True)
+    plt.tight_layout()
+    plt.show()
