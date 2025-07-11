@@ -1,0 +1,187 @@
+# === IMPORTS ===
+import torch
+import torch.nn as nn
+import torch.fft as fft
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, TensorDataset
+import matplotlib.pyplot as plt
+import time
+import pandas as pd
+import os
+from datetime import datetime
+
+# === FIXED BASE CONFIG ===
+base_config = {
+    'modes': 16,
+    'width': 96,
+    'epochs': 100,  
+    'batch_size': 8,
+    'dt': 0.01,
+    'nu': 1e-3,
+    'grid_size': 32,
+    'train_samples': 10000,
+    'val_samples': 1000
+}
+
+# === SPECTRAL CONVOLUTION LAYER ===
+class SpectralConv2d(nn.Module):
+    def __init__(self, in_channels, out_channels, modes):
+        super().__init__()
+        self.weights = nn.Parameter((1 / (in_channels * out_channels)) *
+                                    torch.rand(in_channels, out_channels, modes, modes, dtype=torch.cfloat))
+        self.modes = modes
+
+    def compl_mul2d(self, input, weights):
+        return torch.einsum("bixy, ioxy -> boxy", input, weights)
+
+    def forward(self, x):
+        B, C, H, W = x.shape
+        x_ft = fft.fft2(x, norm="ortho")
+        out_ft = torch.zeros(B, self.weights.shape[1], H, W, dtype=torch.cfloat, device=x.device)
+        out_ft[:, :, :self.modes, :self.modes] = self.compl_mul2d(x_ft[:, :, :self.modes, :self.modes], self.weights)
+        return fft.ifft2(out_ft, norm="ortho").real
+
+# === FNO MODEL ===
+class FNO2D(nn.Module):
+    def __init__(self, modes, width):
+        super().__init__()
+        self.fc0 = nn.Linear(1, width)
+        self.conv1 = SpectralConv2d(width, width, modes)
+        self.conv2 = SpectralConv2d(width, width, modes)
+        self.w1 = nn.Conv2d(width, width, 1)
+        self.w2 = nn.Conv2d(width, width, 1)
+        self.fc1 = nn.Linear(width, 128)
+        self.fc2 = nn.Linear(128, 1)
+
+    def forward(self, x):
+        x = self.fc0(x.unsqueeze(-1)).permute(0, 3, 1, 2)
+        x = F.gelu(self.conv1(x) + self.w1(x))
+        x = F.gelu(self.conv2(x) + self.w2(x))
+        x = x.permute(0, 2, 3, 1)
+        return self.fc2(F.gelu(self.fc1(x))).squeeze(-1)
+
+# === RELATIVE ERROR (CLASSIFICATION-STYLE) ===
+def classification_error(pred, yb):
+    pred_classes = torch.round(pred)
+    true_classes = torch.round(yb)
+    num_correct = (pred_classes == true_classes).sum().item()
+    num_total = yb.numel()
+    return (num_total - num_correct) / num_total
+
+# === BINARY SEARCH FUNCTION ===
+def binary_search_param(param_name, param_values, out_dir, log):
+    results = []
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    log.write(f"\n===== Binary Search on {param_name} =====\n")
+    log.write("Control values:\n")
+    for k, v in base_config.items():
+        if k != param_name:
+            log.write(f"  {k}: {v}\n")
+    log.write("\n")
+
+    for grid_size in [32, 64]:
+        all_iters = []
+        left_val, right_val = float(min(param_values)), float(max(param_values))
+        iteration = 1
+
+        while abs(right_val - left_val) > 1e-2:
+            mid_val = (left_val + right_val) / 2
+            sweep_vals = [left_val, mid_val, right_val]
+            log.write(f"[Iteration {iteration}] Sweeping {param_name} values: {sweep_vals}\n")
+            print(f"[Iteration {iteration}] Sweeping {param_name} values: {sweep_vals}")
+            iteration += 1
+
+            iter_results = []
+            for val in sweep_vals:
+                config = base_config.copy()
+                config[param_name] = val
+                config['grid_size'] = grid_size
+
+                data = torch.load('synthetic_data_ns2d/synthetic_data.pt')
+                x_train, y_train = data[:config['train_samples'], 0], data[:config['train_samples'], 1]
+                x_val, y_val = data[config['train_samples']:][:config['val_samples'], 0], data[config['train_samples']:][:config['val_samples'], 1]
+
+                model = FNO2D(int(config['modes']), int(config['width'])).to(device)
+                optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+                loss_fn = nn.MSELoss()
+
+                train_loader = DataLoader(TensorDataset(x_train, y_train), batch_size=int(config['batch_size']), shuffle=True)
+                val_loader = DataLoader(TensorDataset(x_val, y_val), batch_size=int(config['batch_size']))
+
+                for ep in range(int(config['epochs'])):
+                    model.train()
+                    for xb, yb in train_loader:
+                        xb, yb = xb.to(device), yb.to(device)
+                        optimizer.zero_grad()
+                        loss = loss_fn(model(xb), yb)
+                        loss.backward()
+                        optimizer.step()
+
+                model.eval()
+                xb, yb = next(iter(val_loader))
+                xb, yb = xb.to(device), yb.to(device)
+                start = time.time()
+                with torch.no_grad():
+                    pred = model(xb)
+                end = time.time()
+
+                infer_time = (end - start) / len(xb)  # seconds per sample
+                rel_err = classification_error(pred, yb)  # between 0 and 1
+                score = rel_err * (infer_time * 1000)  # milliseconds × relative error
+
+                log.write(f"    → {param_name}={val:.4f}, Rel Err={rel_err:.4e}, Time={infer_time:.4e}, Score={score:.4e}\n")
+                results.append((val, grid_size, rel_err, infer_time, score))
+                iter_results.append((val, score))
+
+            best_val = min(iter_results, key=lambda x: x[1])[0]
+            all_iters.append((iteration - 1, iter_results))
+
+            if best_val <= mid_val:
+                right_val = mid_val
+            else:
+                left_val = mid_val
+
+        # Plot after convergence
+        os.makedirs(out_dir, exist_ok=True)
+        fig, ax = plt.subplots()
+        for iter_num, iter_data in all_iters:
+            x_vals = [v for v, _ in iter_data]
+            y_vals = [s for _, s in iter_data]
+            ax.plot(x_vals, y_vals, marker='o', label=f"Iter {iter_num}")
+        ax.set_title(f"{timestamp} Binary Search: {param_name} (Grid {grid_size})")
+        ax.set_xlabel(param_name)
+        ax.set_ylabel("Score (Rel Err × ms)")
+        ax.legend()
+        ax.grid(True)
+        plt.tight_layout()
+        plot_path = f"{out_dir}/{timestamp}_overlay_{param_name}_grid{grid_size}.png"
+        plt.savefig(plot_path)
+        plt.show()
+
+    return results, timestamp
+
+# === PARAMETER SWEEPS ===
+sweep_settings = {
+    'width': [16, 32, 64, 128, 256],
+    'epochs': [1, 250, 500],
+    'modes': list(range(4, 33, 4)),
+    'batch_size': [2, 4, 8, 16],
+    'dt': [0.001, 0.005, 0.01, 0.02, 0.04],
+    'nu': [1e-5, 1e-4, 1e-3, 1e-2]
+}
+
+# === MAIN EXECUTION ===
+timestamp_folder = f"sweep_results/sweep_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+os.makedirs(timestamp_folder, exist_ok=True)
+log_file_path = os.path.join(timestamp_folder, "search_log.txt")
+
+with open(log_file_path, "w") as log:
+    for param_name, param_values in sweep_settings.items():
+        results, timestamp = binary_search_param(param_name, param_values, out_dir=timestamp_folder, log=log)
+        df = pd.DataFrame(results, columns=[param_name, 'Grid Size', 'Relative Error', 'Inference Time (s)', 'Score'])
+        csv_path = f"{timestamp_folder}/{timestamp}_binarysearch_{param_name}.csv"
+        df.to_csv(csv_path, index=False)
+        log.write(f"\nSaved CSV to: {csv_path}\n\n")
+        print(f"Saved CSV to: {csv_path}\n")
