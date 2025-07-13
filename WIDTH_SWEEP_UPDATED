@@ -1,5 +1,3 @@
-# fno_sweep_width.py
-
 import torch
 import torch.nn as nn
 import torch.fft as fft
@@ -72,7 +70,7 @@ def classification_error(pred, yb):
 # === CACHE TO AVOID REDO ===
 result_cache = {}
 
-def train_and_evaluate(config, device):
+def train_and_evaluate(config, device, log):
     key = tuple(sorted(config.items()))
     if key in result_cache:
         return result_cache[key]
@@ -93,12 +91,19 @@ def train_and_evaluate(config, device):
 
     for ep in range(config['epochs']):
         model.train()
+        running_loss = 0.0
         for xb, yb in train_loader:
             xb, yb = xb.to(device), yb.to(device)
             optimizer.zero_grad()
             loss = loss_fn(model(xb), yb)
             loss.backward()
             optimizer.step()
+            running_loss += loss.item()
+
+        epoch_log = f"Running: epoch {ep+1}/{config['epochs']} | width={config['width']}, grid={config['grid_size']}, loss={running_loss:.4f}\n"
+        print(epoch_log.strip())
+        log.write(epoch_log)
+        log.flush()
 
     model.eval()
     xb, yb = next(iter(val_loader))
@@ -136,7 +141,7 @@ def binary_search_param(param_name, param_values, out_dir, log):
             config = base_config.copy()
             config[param_name] = val
 
-            rel_err, infer_time, score = train_and_evaluate(config, device)
+            rel_err, infer_time, score = train_and_evaluate(config, device, log)
             log_line = f"    → {param_name}={val}, Rel Err={rel_err:.4e}, Time={infer_time:.4e}, Score={score:.4e}\n"
             log.write(log_line)
             print(log_line.strip())
