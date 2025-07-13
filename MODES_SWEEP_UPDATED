@@ -1,5 +1,3 @@
-# fno_sweep_modes.py
-
 import torch
 import torch.nn as nn
 import torch.fft as fft
@@ -24,7 +22,6 @@ base_config = {
     'val_samples': 1000
 }
 
-# === SPECTRAL CONVOLUTION LAYER ===
 class SpectralConv2d(nn.Module):
     def __init__(self, in_channels, out_channels, modes):
         super().__init__()
@@ -42,7 +39,6 @@ class SpectralConv2d(nn.Module):
         out_ft[:, :, :self.modes, :self.modes] = self.compl_mul2d(x_ft[:, :, :self.modes, :self.modes], self.weights)
         return fft.ifft2(out_ft, norm="ortho").real
 
-# === FNO MODEL ===
 class FNO2D(nn.Module):
     def __init__(self, modes, width):
         super().__init__()
@@ -61,7 +57,6 @@ class FNO2D(nn.Module):
         x = x.permute(0, 2, 3, 1)
         return self.fc2(F.gelu(self.fc1(x))).squeeze(-1)
 
-# === CLASSIFICATION ERROR ===
 def classification_error(pred, yb):
     pred_classes = torch.round(pred)
     true_classes = torch.round(yb)
@@ -69,10 +64,9 @@ def classification_error(pred, yb):
     num_total = yb.numel()
     return (num_total - num_correct) / num_total
 
-# === CACHE TO AVOID REDO ===
 result_cache = {}
 
-def train_and_evaluate(config, device):
+def train_and_evaluate(config, device, log, param_name, val):
     key = tuple(sorted(config.items()))
     if key in result_cache:
         return result_cache[key]
@@ -91,14 +85,21 @@ def train_and_evaluate(config, device):
     optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
     loss_fn = nn.MSELoss()
 
-    for ep in range(config['epochs']):
+    for ep in range(int(config['epochs'])):
         model.train()
+        running_loss = 0.0
         for xb, yb in train_loader:
             xb, yb = xb.to(device), yb.to(device)
             optimizer.zero_grad()
             loss = loss_fn(model(xb), yb)
             loss.backward()
             optimizer.step()
+            running_loss += loss.item()
+
+        epoch_log = f"Running: epoch {ep+1}/{int(config['epochs'])} | {param_name}={val}, grid={config['grid_size']}, loss={running_loss:.4f}\n"
+        print(epoch_log.strip())
+        log.write(epoch_log)
+        log.flush()
 
     model.eval()
     xb, yb = next(iter(val_loader))
@@ -115,18 +116,17 @@ def train_and_evaluate(config, device):
     result_cache[key] = (rel_err, infer_time, score)
     return rel_err, infer_time, score
 
-# === BINARY SEARCH ===
 def binary_search_param(param_name, param_values, out_dir, log):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    left_val, right_val = int(min(param_values)), int(max(param_values))
+    left_val, right_val = float(min(param_values)), float(max(param_values))
     iteration = 1
     results = []
 
     log.write(f"\n===== Binary Search on {param_name} =====\n")
-    while right_val - left_val >= 1:
+    while abs(right_val - left_val) > 1:
         mid_val = (left_val + right_val) // 2
-        sweep_vals = [left_val, mid_val, right_val]
+        sweep_vals = [int(left_val), int(mid_val), int(right_val)]
         log.write(f"[Iteration {iteration}] {param_name} values: {sweep_vals}\n")
         print(f"[Iteration {iteration}] {param_name} values: {sweep_vals}")
         iteration += 1
@@ -136,7 +136,7 @@ def binary_search_param(param_name, param_values, out_dir, log):
             config = base_config.copy()
             config[param_name] = val
 
-            rel_err, infer_time, score = train_and_evaluate(config, device)
+            rel_err, infer_time, score = train_and_evaluate(config, device, log, param_name, val)
             log_line = f"    → {param_name}={val}, Rel Err={rel_err:.4e}, Time={infer_time:.4e}, Score={score:.4e}\n"
             log.write(log_line)
             print(log_line.strip())
@@ -155,10 +155,11 @@ def binary_search_param(param_name, param_values, out_dir, log):
     df.to_csv(csv_path, index=False)
     log.write(f"\nSaved CSV to: {csv_path}\n")
     print(f"Saved CSV to: {csv_path}\n")
+    print("Search complete. Check log and CSV for results.")
 
 # === MAIN EXECUTION ===
 sweep_param = 'modes'
-sweep_range = [4, 64]  # powers of 2 often, but full int sweep range
+sweep_range = [4, 64]
 
 output_dir = f"sweep_results/sweep_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
 os.makedirs(output_dir, exist_ok=True)
