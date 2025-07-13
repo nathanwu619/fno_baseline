@@ -21,7 +21,7 @@ base_config = {
     'train_samples': 9000,
     'val_samples': 1000
 }
-
+#
 # === SPECTRAL CONVOLUTION LAYER ===
 class SpectralConv2d(nn.Module):
     def __init__(self, in_channels, out_channels, modes):
