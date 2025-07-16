@@ -3,7 +3,6 @@ import torch.nn as nn
 import torch.fft as fft
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, TensorDataset, random_split
-import matplotlib.pyplot as plt
 import time
 import pandas as pd
 import os
@@ -35,8 +34,9 @@ class SpectralConv2d(nn.Module):
     def forward(self, x):
         B, C, H, W = x.shape
         x_ft = fft.fft2(x, norm="ortho")
+        x_ft = x_ft[:, :, :self.modes, :self.modes]  # crop to match weights
         out_ft = torch.zeros(B, self.weights.shape[1], H, W, dtype=torch.cfloat, device=x.device)
-        out_ft[:, :, :self.modes, :self.modes] = self.compl_mul2d(x_ft[:, :, :self.modes, :self.modes], self.weights)
+        out_ft[:, :, :self.modes, :self.modes] = self.compl_mul2d(x_ft, self.weights)
         return fft.ifft2(out_ft, norm="ortho").real
 
 class FNO2D(nn.Module):
@@ -87,19 +87,12 @@ def train_and_evaluate(config, device, log, param_name, val):
 
     for ep in range(int(config['epochs'])):
         model.train()
-        running_loss = 0.0
         for xb, yb in train_loader:
             xb, yb = xb.to(device), yb.to(device)
             optimizer.zero_grad()
             loss = loss_fn(model(xb), yb)
             loss.backward()
             optimizer.step()
-            running_loss += loss.item()
-
-        epoch_log = f"Running: epoch {ep+1}/{int(config['epochs'])} | {param_name}={val}, grid={config['grid_size']}, loss={running_loss:.4f}\n"
-        print(epoch_log.strip())
-        log.write(epoch_log)
-        log.flush()
 
     model.eval()
     xb, yb = next(iter(val_loader))
@@ -119,14 +112,14 @@ def train_and_evaluate(config, device, log, param_name, val):
 def binary_search_param(param_name, param_values, out_dir, log):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    left_val, right_val = float(min(param_values)), float(max(param_values))
+    left_val, right_val = int(min(param_values)), int(max(param_values))
     iteration = 1
     results = []
 
     log.write(f"\n===== Binary Search on {param_name} =====\n")
-    while abs(right_val - left_val) > 1:
+    while right_val - left_val > 2:
         mid_val = (left_val + right_val) // 2
-        sweep_vals = [int(left_val), int(mid_val), int(right_val)]
+        sweep_vals = sorted(set([left_val, mid_val, right_val]))
         log.write(f"[Iteration {iteration}] {param_name} values: {sweep_vals}\n")
         print(f"[Iteration {iteration}] {param_name} values: {sweep_vals}")
         iteration += 1
@@ -134,7 +127,7 @@ def binary_search_param(param_name, param_values, out_dir, log):
         iter_results = []
         for val in sweep_vals:
             config = base_config.copy()
-            config[param_name] = val
+            config[param_name] = int(val)
 
             rel_err, infer_time, score = train_and_evaluate(config, device, log, param_name, val)
             log_line = f"    → {param_name}={val}, Rel Err={rel_err:.4e}, Time={infer_time:.4e}, Score={score:.4e}\n"
@@ -144,10 +137,22 @@ def binary_search_param(param_name, param_values, out_dir, log):
             iter_results.append((val, score))
 
         best_val = min(iter_results, key=lambda x: x[1])[0]
-        if best_val <= mid_val:
+        if best_val == left_val:
             right_val = mid_val
-        else:
+        elif best_val == right_val:
             left_val = mid_val
+        else:
+            left_val = sweep_vals[0]
+            right_val = sweep_vals[-1]
+
+    for val in range(left_val, right_val + 1):
+        config = base_config.copy()
+        config[param_name] = int(val)
+        rel_err, infer_time, score = train_and_evaluate(config, device, log, param_name, val)
+        log_line = f"    → {param_name}={val}, Rel Err={rel_err:.4e}, Time={infer_time:.4e}, Score={score:.4e}\n"
+        log.write(log_line)
+        print(log_line.strip())
+        results.append((val, rel_err, infer_time, score))
 
     os.makedirs(out_dir, exist_ok=True)
     df = pd.DataFrame(results, columns=[param_name, 'Relative Error', 'Inference Time (s)', 'Score'])
