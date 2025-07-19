@@ -1,0 +1,153 @@
+import torch
+import torch.nn as nn
+import torch.fft as fft
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, TensorDataset
+import torch.quantization as tq
+import time
+import matplotlib.pyplot as plt
+
+# Optional: limit number of threads to avoid CPU overload
+# torch.set_num_threads(4)
+
+# === FIXED PARAMETERS ===
+config = {
+    'modes': 32,
+    'width': 256,
+    'epochs': 500,
+    'batch_size': 128,
+    'dt': 0.0208,
+    'nu': 1e-4,
+    'grid_size': 32,
+    'train_samples': 9000,
+    'val_samples': 1000
+}
+
+class SpectralConv2d(nn.Module):
+    def __init__(self, in_channels, out_channels, modes):
+        super().__init__()
+        self.weights = nn.Parameter((1 / (in_channels * out_channels)) *
+                                    torch.rand(in_channels, out_channels, modes, modes, dtype=torch.cfloat))
+        self.modes = modes
+
+    def compl_mul2d(self, input, weights):
+        return torch.einsum("bixy, ioxy -> boxy", input, weights)
+
+    def forward(self, x):
+        B, C, H, W = x.shape
+        x_ft = fft.fft2(x, norm="ortho")
+        x_ft = x_ft[:, :, :self.modes, :self.modes]
+        out_ft = torch.zeros(B, self.weights.shape[1], H, W, dtype=torch.cfloat, device=x.device)
+        out_ft[:, :, :self.modes, :self.modes] = self.compl_mul2d(x_ft, self.weights)
+        return fft.ifft2(out_ft, norm="ortho").real
+
+class FNO2D_QAT(nn.Module):
+    def __init__(self, modes, width):
+        super().__init__()
+        self.quant = tq.QuantStub()
+        self.dequant = tq.DeQuantStub()
+        self.fc0 = nn.Linear(1, width)
+        self.conv1 = SpectralConv2d(width, width, modes)
+        self.conv2 = SpectralConv2d(width, width, modes)
+
+        self.w1 = nn.Conv2d(width, width, 1)
+        self.w2 = nn.Conv2d(width, width, 1)
+        self.w1.qconfig = None
+        self.w2.qconfig = None
+
+        self.fc1 = nn.Linear(width, 128)
+        self.fc2 = nn.Linear(128, 1)
+
+    def forward(self, x):
+        x = self.quant(x.unsqueeze(-1))
+        x = self.fc0(x).permute(0, 3, 1, 2)
+
+        x = self.dequant(x)
+        x = F.gelu(self.conv1(x) + self.w1(x))
+        x = F.gelu(self.conv2(x) + self.w2(x))
+        x = x.permute(0, 2, 3, 1)
+
+        x = self.quant(x)
+        x = self.fc2(F.gelu(self.fc1(x))).squeeze(-1)
+        x = self.dequant(x)
+        return x
+
+def classification_error(pred, yb):
+    pred_classes = torch.round(pred)
+    true_classes = torch.round(yb)
+    num_correct = (pred_classes == true_classes).sum().item()
+    num_total = yb.numel()
+    return (num_total - num_correct) / num_total
+
+def run_fixed_qat(config):
+    device = torch.device('cpu')
+    data = torch.load('synthetic_data_ns2d/synthetic_data.pt')
+    total_needed = config['train_samples'] + config['val_samples']
+    x_all, y_all = data[:total_needed, 0], data[:total_needed, 1]
+
+    dataset = TensorDataset(x_all, y_all)
+    train_set, val_set = torch.utils.data.random_split(dataset, [config['train_samples'], config['val_samples']], generator=torch.Generator().manual_seed(42))
+    train_loader = DataLoader(train_set, batch_size=config['batch_size'], shuffle=True)
+    val_loader = DataLoader(val_set, batch_size=config['batch_size'], shuffle=False)
+
+    model = FNO2D_QAT(config['modes'], config['width']).to(device)
+    model.qconfig = tq.get_default_qat_qconfig('fbgemm')
+    tq.prepare_qat(model, inplace=True)
+
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+    loss_fn = nn.MSELoss()
+
+    print("[DEBUG] Starting QAT training loop")
+    for ep in range(config['epochs']):
+        model.train()
+        ep_loss = 0
+        start_ep = time.time()
+        for xb, yb in train_loader:
+            xb, yb = xb.to(device), yb.to(device)
+            optimizer.zero_grad()
+            loss = loss_fn(model(xb), yb)
+            loss.backward()
+            optimizer.step()
+            ep_loss += loss.item()
+        print(f"[DEBUG] Epoch {ep+1}/{config['epochs']} completed in {time.time() - start_ep:.2f}s, Avg Loss: {ep_loss / len(train_loader):.4f}")
+
+    model.to('cpu')
+    tq.convert(model, inplace=True)
+
+    model.eval()
+    xb, yb = next(iter(val_loader))
+    xb, yb = xb.to('cpu'), yb.to('cpu')
+    start = time.time()
+    with torch.no_grad():
+        pred = model(xb)
+    end = time.time()
+
+    infer_time = (end - start) / len(xb)
+    rel_err = classification_error(pred, yb)
+    print("[DEBUG] QAT evaluation complete")
+    return rel_err, infer_time
+
+# === RUN ===
+rel_err_qat, infer_time_qat = run_fixed_qat(config)
+print(f"[QAT] Relative Error: {rel_err_qat:.4e}, Inference Time: {infer_time_qat:.4e} seconds")
+
+# === PLOTTING ===
+labels = ['QAT-8-bit']
+rel_errors = [rel_err_qat]
+infer_times = [infer_time_qat]
+
+plt.figure(figsize=(6, 4))
+plt.bar(labels, rel_errors)
+plt.title('Relative Error Comparison')
+plt.ylabel('Relative Error')
+plt.tight_layout()
+plt.savefig('qat_relative_error.png')
+plt.show()
+
+plt.figure(figsize=(6, 4))
+plt.bar(labels, infer_times)
+plt.title('Inference Time Comparison')
+plt.ylabel('Seconds per Sample')
+plt.tight_layout()
+plt.savefig('qat_inference_time.png')
+plt.show()
