@@ -6,6 +6,8 @@ from torch.utils.data import DataLoader, TensorDataset
 import torch.quantization as tq
 import time
 import matplotlib.pyplot as plt
+import csv
+import os
 
 # === CONFIG ===
 config = {
@@ -69,18 +71,18 @@ class FNO2D_QAT(nn.Module):
         x = self.dequant(x)
         return x
 
-# === TRAIN & EVAL ===
+# === METRICS ===
 def classification_error(pred, yb):
     pred_classes = torch.round(pred)
     true_classes = torch.round(yb)
     num_correct = (pred_classes == true_classes).sum().item()
     return (yb.numel() - num_correct) / yb.numel()
 
+# === TRAIN & EVAL ===
 def run_fixed_qat(config):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"[DEBUG] Using device: {device}")
 
-    # Load and split data
     data = torch.load('synthetic_data_ns2d/synthetic_data.pt')
     total_needed = config['train_samples'] + config['val_samples']
     x_all, y_all = data[:total_needed, 0], data[:total_needed, 1]
@@ -90,7 +92,6 @@ def run_fixed_qat(config):
     train_loader = DataLoader(train_set, batch_size=config['batch_size'], shuffle=True)
     val_loader = DataLoader(val_set, batch_size=config['batch_size'], shuffle=False)
 
-    # Model and QAT setup
     model = FNO2D_QAT(config['modes'], config['width']).to(device)
     model.qconfig = tq.get_default_qat_qconfig('fbgemm')
     tq.prepare_qat(model, inplace=True)
@@ -98,7 +99,16 @@ def run_fixed_qat(config):
     optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
     loss_fn = nn.MSELoss()
 
-    # Training loop
+    # === INIT CSV LOG ===
+    log_dir = 'logs'
+    os.makedirs(log_dir, exist_ok=True)
+
+    train_log_path = os.path.join(log_dir, 'qat_training_log.csv')
+    with open(train_log_path, 'w', newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow(['Epoch', 'Avg Loss', 'Epoch Time (s)'])
+
+    # === TRAINING ===
     print("[DEBUG] Starting QAT training")
     for ep in range(config['epochs']):
         model.train()
@@ -111,9 +121,16 @@ def run_fixed_qat(config):
             loss.backward()
             optimizer.step()
             ep_loss += loss.item()
-        print(f"[DEBUG] Epoch {ep+1}/{config['epochs']} | Time: {time.time() - start_ep:.2f}s | Avg Loss: {ep_loss / len(train_loader):.4f}")
 
-    # Convert model and run inference on CPU
+        epoch_time = time.time() - start_ep
+        avg_loss = ep_loss / len(train_loader)
+        print(f"[DEBUG] Epoch {ep+1}/{config['epochs']} | Time: {epoch_time:.2f}s | Avg Loss: {avg_loss:.4f}")
+
+        with open(train_log_path, 'a', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow([ep + 1, avg_loss, epoch_time])
+
+    # === INFERENCE ON CPU ===
     print("[DEBUG] Moving model to CPU for quantized inference")
     model.to('cpu')
     tq.convert(model, inplace=True)
@@ -131,6 +148,13 @@ def run_fixed_qat(config):
     infer_time = (end - start) / len(xb)
     rel_err = classification_error(pred, yb)
     print("[DEBUG] QAT evaluation complete")
+
+    # === FINAL METRICS LOG ===
+    eval_log_path = os.path.join(log_dir, 'qat_eval_metrics.csv')
+    with open(eval_log_path, 'w', newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow(["Relative Error", "Inference Time (s/sample)"])
+        writer.writerow([rel_err, infer_time])
 
     return rel_err, infer_time
 
