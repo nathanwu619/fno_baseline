@@ -2,14 +2,14 @@ import torch
 import torch.nn as nn
 import torch.fft as fft
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, TensorDataset
 import torch.quantization as tq
+from torch.utils.data import DataLoader, TensorDataset, random_split
 import time
-import matplotlib.pyplot as plt
 import csv
 import os
+import matplotlib.pyplot as plt
 
-# === CONFIG ===
+# === FIXED CONFIG ===
 config = {
     'modes': 32,
     'width': 256,
@@ -22,7 +22,6 @@ config = {
     'val_samples': 1000
 }
 
-# === MODEL COMPONENTS ===
 class SpectralConv2d(nn.Module):
     def __init__(self, in_channels, out_channels, modes):
         super().__init__()
@@ -60,59 +59,45 @@ class FNO2D_QAT(nn.Module):
         x = self.quant(x.unsqueeze(-1))
         x = self.fc0(x).permute(0, 3, 1, 2)
         x = self.dequant(x)
-
-        x = x.contiguous(memory_format=torch.channels_last)
         x = F.gelu(self.conv1(x) + self.w1(x))
         x = F.gelu(self.conv2(x) + self.w2(x))
         x = x.permute(0, 2, 3, 1)
-
         x = self.quant(x)
         x = self.fc2(F.gelu(self.fc1(x))).squeeze(-1)
         x = self.dequant(x)
         return x
 
-# === METRICS ===
 def classification_error(pred, yb):
     pred_classes = torch.round(pred)
     true_classes = torch.round(yb)
-    num_correct = (pred_classes == true_classes).sum().item()
-    return (yb.numel() - num_correct) / yb.numel()
+    return (yb.numel() - (pred_classes == true_classes).sum().item()) / yb.numel()
 
-# === TRAIN & EVAL ===
-def run_fixed_qat(config):
+def train_and_evaluate_qat(config):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"[DEBUG] Using device: {device}")
+    model = FNO2D_QAT(config['modes'], config['width']).to(device)
+    model.qconfig = tq.get_default_qat_qconfig('fbgemm')
+    tq.prepare_qat(model, inplace=True)
 
     data = torch.load('synthetic_data_ns2d/synthetic_data.pt')
     total_needed = config['train_samples'] + config['val_samples']
     x_all, y_all = data[:total_needed, 0], data[:total_needed, 1]
 
     dataset = TensorDataset(x_all, y_all)
-    train_set, val_set = torch.utils.data.random_split(dataset, [config['train_samples'], config['val_samples']], generator=torch.Generator().manual_seed(42))
+    train_set, val_set = random_split(dataset, [config['train_samples'], config['val_samples']], generator=torch.Generator().manual_seed(42))
     train_loader = DataLoader(train_set, batch_size=config['batch_size'], shuffle=True)
     val_loader = DataLoader(val_set, batch_size=config['batch_size'], shuffle=False)
-
-    model = FNO2D_QAT(config['modes'], config['width']).to(device)
-    model.qconfig = tq.get_default_qat_qconfig('fbgemm')
-    tq.prepare_qat(model, inplace=True)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
     loss_fn = nn.MSELoss()
 
-    # === INIT CSV LOG ===
-    log_dir = 'logs'
-    os.makedirs(log_dir, exist_ok=True)
+    train_log = []
+    os.makedirs("logs", exist_ok=True)
+    with open("logs/qat_training_log.csv", "w", newline='') as f:
+        csv.writer(f).writerow(["Epoch", "Train Loss"])
 
-    train_log_path = os.path.join(log_dir, 'qat_training_log.csv')
-    with open(train_log_path, 'w', newline='') as f:
-        writer = csv.writer(f)
-        writer.writerow(['Epoch', 'Avg Loss', 'Epoch Time (s)'])
-
-    # === TRAINING ===
-    print("[DEBUG] Starting QAT training")
     for ep in range(config['epochs']):
         model.train()
-        ep_loss = 0
+        total_loss = 0
         start_ep = time.time()
         for xb, yb in train_loader:
             xb, yb = xb.to(device), yb.to(device)
@@ -120,26 +105,18 @@ def run_fixed_qat(config):
             loss = loss_fn(model(xb), yb)
             loss.backward()
             optimizer.step()
-            ep_loss += loss.item()
+            total_loss += loss.item()
+        duration = time.time() - start_ep
+        avg_loss = total_loss / len(train_loader)
+        train_log.append(avg_loss)
+        with open("logs/qat_training_log.csv", "a", newline='') as f:
+            csv.writer(f).writerow([ep + 1, avg_loss])
+        print(f"[Epoch {ep+1}] Train Loss: {avg_loss:.6f} | Time: {duration:.2f}s")
 
-        epoch_time = time.time() - start_ep
-        avg_loss = ep_loss / len(train_loader)
-        print(f"[DEBUG] Epoch {ep+1}/{config['epochs']} | Time: {epoch_time:.2f}s | Avg Loss: {avg_loss:.4f}")
-
-        with open(train_log_path, 'a', newline='') as f:
-            writer = csv.writer(f)
-            writer.writerow([ep + 1, avg_loss, epoch_time])
-
-    # === INFERENCE ON CPU ===
-    print("[DEBUG] Moving model to CPU for quantized inference")
-    model.to('cpu')
-    tq.convert(model, inplace=True)
     model.eval()
-
     xb, yb = next(iter(val_loader))
-    xb, yb = xb.to('cpu'), yb.to('cpu')
+    xb, yb = xb.to(device), yb.to(device)
 
-    print("[DEBUG] Running final inference")
     start = time.time()
     with torch.no_grad():
         pred = model(xb)
@@ -147,38 +124,21 @@ def run_fixed_qat(config):
 
     infer_time = (end - start) / len(xb)
     rel_err = classification_error(pred, yb)
-    print("[DEBUG] QAT evaluation complete")
 
-    # === FINAL METRICS LOG ===
-    eval_log_path = os.path.join(log_dir, 'qat_eval_metrics.csv')
-    with open(eval_log_path, 'w', newline='') as f:
-        writer = csv.writer(f)
-        writer.writerow(["Relative Error", "Inference Time (s/sample)"])
-        writer.writerow([rel_err, infer_time])
+    with open("logs/qat_eval_metrics.csv", "w", newline='') as f:
+        csv.writer(f).writerow(["Relative Error", "Inference Time (s/sample)"])
+        csv.writer(f).writerow([rel_err, infer_time])
 
-    return rel_err, infer_time
+    print(f"[QAT-FNO] Relative Error: {rel_err:.4e}, Inference Time: {infer_time:.4e} seconds")
 
-# === RUN ===
-rel_err_qat, infer_time_qat = run_fixed_qat(config)
-print(f"[QAT] Relative Error: {rel_err_qat:.4e}, Inference Time: {infer_time_qat:.4e} seconds")
+    plt.figure(figsize=(6, 4))
+    plt.plot(range(1, config['epochs'] + 1), train_log, label="Train Loss")
+    plt.xlabel("Epoch")
+    plt.ylabel("MSE Loss")
+    plt.title("QAT-FNO Training Loss")
+    plt.grid(True)
+    plt.tight_layout()
+    plt.savefig("logs/qat_training_curve.png")
+    plt.show()
 
-# === PLOTS ===
-labels = ['QAT-8-bit']
-rel_errors = [rel_err_qat]
-infer_times = [infer_time_qat]
-
-plt.figure(figsize=(6, 4))
-plt.bar(labels, rel_errors)
-plt.title('Relative Error Comparison')
-plt.ylabel('Relative Error')
-plt.tight_layout()
-plt.savefig('qat_relative_error.png')
-plt.show()
-
-plt.figure(figsize=(6, 4))
-plt.bar(labels, infer_times)
-plt.title('Inference Time Comparison')
-plt.ylabel('Seconds per Sample')
-plt.tight_layout()
-plt.savefig('qat_inference_time.png')
-plt.show()
+train_and_evaluate_qat(config)
