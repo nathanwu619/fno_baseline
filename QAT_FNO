@@ -13,7 +13,7 @@ import matplotlib.pyplot as plt
 config = {
     'modes': 32,
     'width': 256,
-    'epochs': 500,
+    'epochs': 10,
     'batch_size': 128,
     'dt': 0.0208,
     'nu': 1e-4,
@@ -80,7 +80,7 @@ def train_and_evaluate_qat(config):
     # === Build model ===
     model = FNO2D_QAT(config['modes'], config['width'])
     model.qconfig = tq.get_default_qat_qconfig('fbgemm')
-    tq.prepare_qat(model, inplace=True)  # QAT preparation happens here
+    tq.prepare_qat(model, inplace=True)  # QAT preparation
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     model.to(device)
@@ -96,7 +96,6 @@ def train_and_evaluate_qat(config):
     for ep in range(config['epochs']):
         model.train()
 
-        # === Freeze observer after warm-up ===
         if ep == 10:
             model.apply(torch.quantization.disable_observer)
 
@@ -116,10 +115,9 @@ def train_and_evaluate_qat(config):
             csv.writer(f).writerow([ep + 1, avg_loss, duration])
         print(f"[Epoch {ep+1}] Train Loss: {avg_loss:.6f} | Time: {duration:.2f}s")
 
-    # === Convert to quantized model and evaluate ===
+    # === Evaluate (without torch.quantization.convert) ===
     model.to('cpu')
     model.eval()
-    tq.convert(model, inplace=True)  # Finalize QAT with real quantized weights
 
     xb, yb = next(iter(val_loader))
     xb, yb = xb.to('cpu'), yb.to('cpu')
@@ -135,20 +133,28 @@ def train_and_evaluate_qat(config):
         csv.writer(f).writerow(["Relative Error", "Inference Time (s/sample)"])
         csv.writer(f).writerow([rel_err, infer_time])
 
-    print(f"\n=== QAT FNO CPU Inference ===")
+    print(f"\n=== QAT FNO CPU Inference (Fake Quant) ===")
     print(f"Relative Error: {rel_err:.4e}")
     print(f"Inference Time per sample (on CPU): {infer_time:.4e} seconds")
     print(f"Training log saved to logs/qat_training_log.csv")
 
+    # === Plot ===
     plt.figure(figsize=(6, 4))
     plt.plot(range(1, config['epochs'] + 1), train_log, label="Train Loss")
     plt.xlabel("Epoch")
     plt.ylabel("MSE Loss")
-    plt.title("QAT-FNO Training Loss")
+    plt.title("QAT-FNO Training Loss (Fake Quant)")
     plt.grid(True)
     plt.tight_layout()
     plt.savefig("logs/qat_training_curve.png")
     plt.show()
+    
+    return model
 
 # === RUN ===
 train_and_evaluate_qat(config)
+
+# === Save trained QAT model state ===
+model = train_and_evaluate_qat(config)
+torch.save(model.state_dict(), "qat_fno_trained.pth")
+print("Saved model as qat_fno_trained.pth")
