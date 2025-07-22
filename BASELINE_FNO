@@ -12,7 +12,7 @@ from datetime import datetime
 base_config = {
     'modes': 32,
     'width': 256,
-    'epochs': 500,
+    'epochs': 10,
     'batch_size': 128,
     'dt': 0.0208,
     'nu': 1e-4,
