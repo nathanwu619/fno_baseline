@@ -7,8 +7,14 @@ import time
 import os
 import csv
 from datetime import datetime
+import sys
 
-# === FIXED BASE CONFIG ===
+if not torch.cuda.is_available():
+    print("CUDA not available. Please ensure your GPU is properly configured.")
+    sys.exit(1)
+else:
+    print(f"CUDA available. Using GPU: {torch.cuda.get_device_name(0)}")
+
 base_config = {
     'modes': 32,
     'width': 256,
@@ -65,8 +71,8 @@ def classification_error(pred, yb):
     return (num_total - num_correct) / num_total
 
 def run_single_config(config):
-    train_device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"Training on: {train_device}")
+    train_device = torch.device('cuda')
+    print(f"Training on device: {train_device} ({torch.cuda.get_device_name(0)})")
 
     data = torch.load('synthetic_data_ns2d/synthetic_data.pt')
     total_needed = config['train_samples'] + config['val_samples']
@@ -105,10 +111,8 @@ def run_single_config(config):
             csv.writer(f).writerow([ep + 1, avg_loss, duration])
         print(f"[Epoch {ep+1}] Train Loss: {avg_loss:.6f} | Time: {duration:.2f}s")
 
-    # === Move model and batch to CPU for fair inference ===
     model.eval()
     model.to('cpu')
-
     xb, yb = next(iter(val_loader))
     xb, yb = xb.to('cpu'), yb.to('cpu')
 
@@ -121,7 +125,7 @@ def run_single_config(config):
     rel_err = classification_error(pred, yb)
     score = rel_err * (infer_time * 1000)
 
-    print(f"\n=== Baseline FNO CPU Inference ===")
+    print(f"\n === Baseline FNO CPU Inference ===")
     print(f"Relative Error: {rel_err:.4e}")
     print(f"Inference Time per sample (on CPU): {infer_time:.4e} seconds")
     print(f"Score (RelErr × Time × 1000): {score:.4e}")
