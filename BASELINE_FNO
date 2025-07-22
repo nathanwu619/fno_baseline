@@ -1,0 +1,131 @@
+import torch
+import torch.nn as nn
+import torch.fft as fft
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, TensorDataset, random_split
+import time
+import os
+import csv
+from datetime import datetime
+
+# === FIXED BASE CONFIG ===
+base_config = {
+    'modes': 32,
+    'width': 256,
+    'epochs': 500,
+    'batch_size': 128,
+    'dt': 0.0208,
+    'nu': 1e-4,
+    'grid_size': 32,
+    'train_samples': 9000,
+    'val_samples': 1000
+}
+
+class SpectralConv2d(nn.Module):
+    def __init__(self, in_channels, out_channels, modes):
+        super().__init__()
+        self.weights = nn.Parameter((1 / (in_channels * out_channels)) *
+                                    torch.rand(in_channels, out_channels, modes, modes, dtype=torch.cfloat))
+        self.modes = modes
+
+    def compl_mul2d(self, input, weights):
+        return torch.einsum("bixy, ioxy -> boxy", input, weights)
+
+    def forward(self, x):
+        B, C, H, W = x.shape
+        x_ft = fft.fft2(x, norm="ortho")
+        x_ft = x_ft[:, :, :self.modes, :self.modes]
+        out_ft = torch.zeros(B, self.weights.shape[1], H, W, dtype=torch.cfloat, device=x.device)
+        out_ft[:, :, :self.modes, :self.modes] = self.compl_mul2d(x_ft, self.weights)
+        return fft.ifft2(out_ft, norm="ortho").real
+
+class FNO2D(nn.Module):
+    def __init__(self, modes, width):
+        super().__init__()
+        self.fc0 = nn.Linear(1, width)
+        self.conv1 = SpectralConv2d(width, width, modes)
+        self.conv2 = SpectralConv2d(width, width, modes)
+        self.w1 = nn.Conv2d(width, width, 1)
+        self.w2 = nn.Conv2d(width, width, 1)
+        self.fc1 = nn.Linear(width, 128)
+        self.fc2 = nn.Linear(128, 1)
+
+    def forward(self, x):
+        x = self.fc0(x.unsqueeze(-1)).permute(0, 3, 1, 2)
+        x = F.gelu(self.conv1(x) + self.w1(x))
+        x = F.gelu(self.conv2(x) + self.w2(x))
+        x = x.permute(0, 2, 3, 1)
+        return self.fc2(F.gelu(self.fc1(x))).squeeze(-1)
+
+def classification_error(pred, yb):
+    pred_classes = torch.round(pred)
+    true_classes = torch.round(yb)
+    num_correct = (pred_classes == true_classes).sum().item()
+    num_total = yb.numel()
+    return (num_total - num_correct) / num_total
+
+def run_single_config(config):
+    train_device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"Training on: {train_device}")
+
+    data = torch.load('synthetic_data_ns2d/synthetic_data.pt')
+    total_needed = config['train_samples'] + config['val_samples']
+    x_all, y_all = data[:total_needed, 0], data[:total_needed, 1]
+
+    dataset = TensorDataset(x_all, y_all)
+    generator = torch.Generator().manual_seed(42)
+    train_set, val_set = random_split(dataset, [config['train_samples'], config['val_samples']], generator=generator)
+    train_loader = DataLoader(train_set, batch_size=config['batch_size'], shuffle=True)
+    val_loader = DataLoader(val_set, batch_size=config['batch_size'], shuffle=False)
+
+    model = FNO2D(config['modes'], config['width']).to(train_device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+    loss_fn = nn.MSELoss()
+
+    os.makedirs("logs", exist_ok=True)
+    csv_path = "logs/baseline_training_log.csv"
+    with open(csv_path, "w", newline='') as f:
+        csv.writer(f).writerow(["Epoch", "Train Loss", "Time (s)"])
+
+    print("Starting training...")
+    for ep in range(config['epochs']):
+        model.train()
+        total_loss = 0
+        start_ep = time.time()
+        for xb, yb in train_loader:
+            xb, yb = xb.to(train_device), yb.to(train_device)
+            optimizer.zero_grad()
+            loss = loss_fn(model(xb), yb)
+            loss.backward()
+            optimizer.step()
+            total_loss += loss.item()
+        duration = time.time() - start_ep
+        avg_loss = total_loss / len(train_loader)
+        with open(csv_path, "a", newline='') as f:
+            csv.writer(f).writerow([ep + 1, avg_loss, duration])
+        print(f"[Epoch {ep+1}] Train Loss: {avg_loss:.6f} | Time: {duration:.2f}s")
+
+    # === Move model and batch to CPU for fair inference ===
+    model.eval()
+    model.to('cpu')
+
+    xb, yb = next(iter(val_loader))
+    xb, yb = xb.to('cpu'), yb.to('cpu')
+
+    start = time.time()
+    with torch.no_grad():
+        pred = model(xb)
+    end = time.time()
+
+    infer_time = (end - start) / len(xb)
+    rel_err = classification_error(pred, yb)
+    score = rel_err * (infer_time * 1000)
+
+    print(f"\n=== Baseline FNO CPU Inference ===")
+    print(f"Relative Error: {rel_err:.4e}")
+    print(f"Inference Time per sample (on CPU): {infer_time:.4e} seconds")
+    print(f"Score (RelErr × Time × 1000): {score:.4e}")
+    print(f"Training log saved to {csv_path}")
+
+# === RUN ===
+run_single_config(base_config)
