@@ -79,4 +79,4 @@ end = time.time()
 
 print("INT8 inference completed")
 print("Output shape:", y.shape)
-print(f"⚡ Inference time: {(end - start) * 1000:.2f} ms")
+print(f"Inference time: {(end - start) * 1000:.2f} ms")
