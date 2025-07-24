@@ -1,177 +1,180 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-import torch.fft as fft
+import torch.optim as optim
+import torch.quantization as quant
 from torch.utils.data import DataLoader, TensorDataset, random_split
-import time, os, csv
+import matplotlib.pyplot as plt
+import time, os
 
 # === CONFIG ===
-base_config = {
+config = {
     'modes': 32,
     'width': 256,
-    'epochs': 20,
+    'epochs': 500,
     'batch_size': 128,
     'dt': 0.0208,
     'nu': 1e-4,
     'grid_size': 32,
     'train_samples': 9000,
     'val_samples': 1000,
-    'freeze_epoch': 2
+    'lr': 1e-3
 }
 
-class SpectralConv2d(nn.Module):
-    def __init__(self, in_channels, out_channels, modes):
-        super().__init__()
-        self.weights = nn.Parameter((1 / (in_channels * out_channels)) *
-                                    torch.rand(in_channels, out_channels, modes, modes, dtype=torch.cfloat))
-        self.modes = modes
+# === Quant Engine Selection ===
+if 'fbgemm' in torch.backends.quantized.supported_engines:
+    torch.backends.quantized.engine = 'fbgemm'
+elif 'qnnpack' in torch.backends.quantized.supported_engines:
+    torch.backends.quantized.engine = 'qnnpack'
+else:
+    raise RuntimeError("No quantized engine available.")
+print(f"Using quantized engine: {torch.backends.quantized.engine}")
 
-    def compl_mul2d(self, input, weights):
-        return torch.einsum("bixy, ioxy -> boxy", input, weights)
+# === Load Dataset ===
+data = torch.load("synthetic_data_ns2d/synthetic_data.pt")
+X = data[:, 0].unsqueeze(1)
+Y = data[:, 1].unsqueeze(1)
+train_set, val_set = random_split(TensorDataset(X, Y), [config['train_samples'], config['val_samples']])
+train_loader = DataLoader(train_set, batch_size=config['batch_size'], shuffle=True)
+test_loader = DataLoader(val_set, batch_size=config['batch_size'], shuffle=False)
+
+# === Define QAT-Compatible FNO ===
+class FourierLayer(nn.Module):
+    def __init__(self, channels, modes):
+        super().__init__()
+        self.channels = channels
+        self.modes = modes
+        self.weight = nn.Parameter(torch.randn(channels, channels, modes, modes, 2) * 0.1)
+
+    def compl_mul2d(self, x_ft, w):
+        if w.dtype in (torch.complex64, torch.complex128):
+            w_c = w
+        else:
+            w_c = torch.view_as_complex(w)
+        return torch.einsum("bixy,ioxy->boxy", x_ft, w_c)
 
     def forward(self, x):
-        B, C, H, W = x.shape
-        x_ft = fft.fft2(x, norm="ortho")
-        x_ft = x_ft[:, :, :self.modes, :self.modes]
-        out_ft = torch.zeros(B, self.weights.shape[1], H, W, dtype=torch.cfloat, device=x.device)
-        out_ft[:, :, :self.modes, :self.modes] = self.compl_mul2d(x_ft, self.weights)
-        return fft.ifft2(out_ft, norm="ortho").real
+        if x.dtype in (torch.quint8, torch.qint8, torch.qint32):
+            x = x.dequantize()
+        x_ft = torch.fft.rfft2(x, norm='ortho')
+        B, C, H, W2 = x_ft.shape
+        modes_x = min(self.modes, H)
+        modes_y = min(self.modes, W2)
+        out_ft = torch.zeros(B, self.channels, H, W2, dtype=torch.cfloat, device=x.device)
+        out_ft[:, :, :modes_x, :modes_y] = self.compl_mul2d(
+            x_ft[:, :, :modes_x, :modes_y],
+            self.weight[:, :, :modes_x, :modes_y]
+        )
+        x = torch.fft.irfft2(out_ft, s=x.shape[-2:], norm='ortho')
+        return x
 
-class QuantFNO2D(nn.Module):
+class SimpleFNO_NS(nn.Module):
     def __init__(self, modes, width):
         super().__init__()
-        self.quant = torch.quantization.QuantStub()
-        self.fc0 = nn.Linear(1, width)  # will be quantized
-        self.conv1 = SpectralConv2d(width, width, modes)
-        self.conv2 = SpectralConv2d(width, width, modes)
-        self.block1 = nn.Sequential(nn.Conv2d(width, width, 1), nn.ReLU())  # will be fused & quantized
-        self.block2 = nn.Sequential(nn.Conv2d(width, width, 1), nn.ReLU())
-        self.fc1 = nn.Linear(width, 128)  # quantized
-        self.relu = nn.ReLU()
-        self.fc2 = nn.Linear(128, 1)  # quantized
-        self.dequant = torch.quantization.DeQuantStub()
+        self.fc0   = nn.Sequential(nn.Conv2d(1, width, 1), nn.ReLU())
+        self.fno1  = nn.Sequential(FourierLayer(width, modes), nn.ReLU())
+        self.fno2  = nn.Sequential(FourierLayer(width, modes), nn.ReLU())
+        self.fno3  = nn.Sequential(FourierLayer(width, modes), nn.ReLU())
+        self.fno4  = nn.Sequential(FourierLayer(width, modes), nn.ReLU())
+        self.fc1   = nn.Sequential(nn.Conv2d(width, width, 1), nn.ReLU())
+        self.fc2   = nn.Conv2d(width, 1, 1)
+
+    def forward(self, x):
+        x = self.fc0(x)
+        x = self.fno1(x)
+        x = self.fno2(x)
+        x = self.fno3(x)
+        x = self.fno4(x)
+        x = self.fc1(x)
+        delta = self.fc2(x)
+        return delta
+
+class QuantizedFNO(nn.Module):
+    def __init__(self, modes, width):
+        super().__init__()
+        self.quant   = quant.QuantStub()
+        self.model   = SimpleFNO_NS(modes, width)
+        self.dequant = quant.DeQuantStub()
 
     def forward(self, x):
         x = self.quant(x)
-        x = self.fc0(x.unsqueeze(-1))  # quantized linear
-        x = self.dequant(x)  # float for FFT ops
+        delta = self.model(x)
+        return self.dequant(x + delta)
 
-        x = x.permute(0, 3, 1, 2)
-        x = self.relu(self.conv1(x))
-        x = self.relu(self.conv2(x))
-
-        x = self.quant(x)
-        x = self.block1(x)
-        x = self.block2(x)
-
-        x = x.permute(0, 2, 3, 1)
-        x = self.fc2(self.relu(self.fc1(x)))  # quantized linear
-        x = self.dequant(x)
-        return x.squeeze(-1)
-
-def fuse_model(model):
-    torch.quantization.fuse_modules(model, [['block1.0', 'block1.1'], ['block2.0', 'block2.1']], inplace=True)
-
-def classification_error(pred, yb):
-    pred_classes = torch.round(pred)
-    true_classes = torch.round(yb)
-    num_correct = (pred_classes == true_classes).sum().item()
-    num_total = yb.numel()
-    return (num_total - num_correct) / num_total
-
-def run_single_config(config):
-    torch.backends.quantized.engine = 'fbgemm'
-    train_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    infer_device = torch.device("cpu")
-    print(f"Training on: {train_device}, Inference on: {infer_device}")
-
-    # === Load Data ===
-    data = torch.load('synthetic_data_ns2d/synthetic_data.pt')
-    total_needed = config['train_samples'] + config['val_samples']
-    x_all, y_all = data[:total_needed, 0], data[:total_needed, 1]
-
-    dataset = TensorDataset(x_all, y_all)
-    generator = torch.Generator().manual_seed(42)
-    train_set, val_set = random_split(dataset, [config['train_samples'], config['val_samples']], generator=generator)
-    train_loader = DataLoader(train_set, batch_size=config['batch_size'], shuffle=True)
-    val_loader = DataLoader(val_set, batch_size=config['batch_size'], shuffle=False)
-
-    # === Model Setup ===
-    model = QuantFNO2D(config['modes'], config['width']).to(train_device)
-    fuse_model(model)
-
-    model.qconfig = torch.quantization.get_default_qat_qconfig('fbgemm')
-    for name, module in model.named_modules():
-        if isinstance(module, SpectralConv2d):
-            module.qconfig = None  # Skip quantizing FFT layers
-
-    torch.quantization.prepare_qat(model, inplace=True)
-
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
-    loss_fn = nn.MSELoss()
-
-    os.makedirs("logs", exist_ok=True)
-    csv_path = "logs/qat_fused_training_log.csv"
-    with open(csv_path, "w", newline='') as f:
-        csv.writer(f).writerow(["Epoch", "Train Loss", "Val Rel Error", "Time (s)", "Infer/sample"])
-
-    for ep in range(config['epochs']):
-        model.train()
-        total_loss = 0
-        start_ep = time.time()
-        for xb, yb in train_loader:
-            xb, yb = xb.to(train_device), yb.to(train_device)
-            optimizer.zero_grad()
-            loss = loss_fn(model(xb), yb)
-            loss.backward()
-            optimizer.step()
-            total_loss += loss.item()
-        duration = time.time() - start_ep
-        avg_loss = total_loss / len(train_loader)
-
-        # Per-epoch val rel error and inference time
-        model.eval()
-        xb, yb = next(iter(val_loader))
-        xb, yb = xb.to(train_device), yb.to(train_device)
-        with torch.no_grad():
-            start = time.time()
-            pred = model(xb)
-            end = time.time()
-        rel_err = classification_error(pred, yb)
-        infer_time = (end - start) / len(xb)
-
-        with open(csv_path, "a", newline='') as f:
-            csv.writer(f).writerow([ep + 1, avg_loss, rel_err, duration, infer_time])
-
-        print(f"[Epoch {ep+1}] Train Loss: {avg_loss:.6f} | Val RelErr: {rel_err:.4e} | Time: {duration:.2f}s | Infer/sample: {infer_time:.4e}s")
-
-        model.train()
-        if ep + 1 == config['freeze_epoch']:
-            print(f"Freezing observers at epoch {ep+1}...")
-            model.apply(torch.quantization.disable_observer)
-
-    # === Convert for Inference ===
-    print("Converting model to int8 for CPU inference...")
-    model.to(infer_device)
-    model.eval()
-    torch.quantization.convert(model, inplace=True)
-
-    # === Final Evaluation ===
-    xb, yb = next(iter(val_loader))
-    xb, yb = xb.to(infer_device), yb.to(infer_device)
-    start = time.time()
-    with torch.no_grad():
+# === Train / Test ===
+def train_epoch(model, loader, optimizer, loss_fn, device):
+    model.train()
+    total = 0.0
+    for xb, yb in loader:
+        xb, yb = xb.to(device), yb.to(device)
+        optimizer.zero_grad()
         pred = model(xb)
-    end = time.time()
-    infer_time = (end - start) / len(xb)
-    rel_err = classification_error(pred, yb)
-    score = rel_err * (infer_time * 1000)
+        loss = loss_fn(pred, yb)
+        loss.backward()
+        optimizer.step()
+        total += loss.item() * xb.size(0)
+    return total / len(loader.dataset)
 
-    print(f"\n === Final Quantized Inference ===")
-    print(f"Relative Error: {rel_err:.4e}")
-    print(f"Inference Time per sample (CPU): {infer_time:.4e} seconds")
-    print(f"Score (RelErr × Time × 1000): {score:.4e}")
-    print(f"Training log saved to {csv_path}")
+def test_model_and_time(model, loader, device):
+    model.eval()
+    errs = []
+    times = []
+    with torch.no_grad():
+        for xb, yb in loader:
+            xb, yb = xb.to(device), yb.to(device)
+            torch.cuda.synchronize() if device.type == 'cuda' else None
+            t0 = time.time()
+            pred = model(xb)
+            torch.cuda.synchronize() if device.type == 'cuda' else None
+            times.append(time.time() - t0)
+            rel_err = (torch.norm(pred - yb) / torch.norm(yb)).item()
+            errs.append(rel_err)
+    return sum(errs)/len(errs), sum(times)/len(times)
 
-# === RUN ===
-run_single_config(base_config)
+# === QAT Training ===
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Running on device: {device}")
+
+model_qat = QuantizedFNO(config['modes'], config['width']).to(device)
+model_qat.qconfig = quant.get_default_qat_qconfig('fbgemm')
+quant.prepare_qat(model_qat, inplace=True)
+
+optimizer = optim.Adam(model_qat.parameters(), lr=config['lr'])
+loss_fn = nn.MSELoss()
+train_losses, test_errors, inf_times = [], [], []
+
+for ep in range(1, config['epochs'] + 1):
+    tr_loss = train_epoch(model_qat, train_loader, optimizer, loss_fn, device)
+    val_err, val_time = test_model_and_time(model_qat, test_loader, device)
+    train_losses.append(tr_loss)
+    test_errors.append(val_err)
+    inf_times.append(val_time)
+    print(f"[Epoch {ep}] Train Loss: {tr_loss:.6f} | Val RelErr: {val_err:.6f} | Inference Time: {val_time * 1000:.2f} ms")
+
+# === Plot ===
+plt.figure()
+plt.plot(range(1, config['epochs'] + 1), train_losses, label='Train Loss')
+plt.plot(range(1, config['epochs'] + 1), test_errors,  label='Test Rel. Error')
+plt.xlabel("Epoch")
+plt.ylabel("Loss / Error")
+plt.title("QAT Training Curve")
+plt.legend()
+plt.grid(True)
+plt.tight_layout()
+plt.savefig("qat_training_curve.png", dpi=300)
+
+# === Save Model ===
+torch.save(model_qat.state_dict(), "qat_fno_ns2d_float.pth")
+print("Saved QAT-trained float model to qat_fno_ns2d_float.pth")
+
+# === Final Evaluation ===
+print("\n=== QAT Final Evaluation ===")
+final_rel_err, inference_time = test_model_and_time(model_qat, test_loader, device)
+print(f"Final Relative L2 Error: {final_rel_err:.6f}")
+print(f"Inference Time per batch ({device.type.upper()}): {inference_time * 1000:.4f} ms")
+print(f"Inference Time per sample: {(inference_time / config['batch_size']) * 1000:.4f} ms")
+
+# === Hybrid Quantization Convert (Partial) ===
+model_qat.eval().cpu()
+quant.convert(model_qat, inplace=True)
+torch.save(model_qat.state_dict(), "qat_fno_ns2d_hybrid_int8.pth")
+print("Saved partially quantized hybrid QAT model to qat_fno_ns2d_hybrid_int8.pth")
