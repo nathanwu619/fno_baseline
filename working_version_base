@@ -1,32 +1,46 @@
+# === IMPORTS ===
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.fft
+import time
+import warnings
 from torch.utils.data import DataLoader, TensorDataset, random_split
-import matplotlib.pyplot as plt
-import time, os
+
+warnings.filterwarnings("ignore", message=".*quant_min and quant_max.*")
 
 # === CONFIG ===
-config = {
-    'modes': 32,
-    'width': 256,
-    'epochs': 500,
-    'batch_size': 128,
-    'dt': 0.0208,
-    'nu': 1e-4,
-    'grid_size': 32,
-    'train_samples': 9000,
-    'val_samples': 1000
-}
+BATCH_SIZE = 128
+TRAIN_SAMPLES = 9000
+VAL_SAMPLES = 1000
+MODES = 32
+WIDTH = 256
+EPOCHS = 500
+DT = 0.0208
+NU = 1e-4
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"[Device] Training float32 model on: {device}")
+
+# === PARAM AUGMENTATION ===
+def augment_with_params(X, dt=DT, nu=NU):
+    B, _, H, W = X.shape
+    dt_channel = torch.full((B, 1, H, W), dt, dtype=X.dtype, device=X.device)
+    nu_channel = torch.full((B, 1, H, W), nu, dtype=X.dtype, device=X.device)
+    return torch.cat([X, dt_channel, nu_channel], dim=1)
 
 # === LOAD DATA ===
+print("[Step] Loading dataset...")
 data = torch.load("synthetic_data_ns2d/synthetic_data.pt")
-X = data[:, 0].unsqueeze(1)  # [N, 1, 32, 32]
-Y = data[:, 1].unsqueeze(1)  # [N, 1, 32, 32]
-train_set, val_set = random_split(TensorDataset(X, Y), [config['train_samples'], config['val_samples']])
-train_loader = DataLoader(train_set, batch_size=config['batch_size'], shuffle=True)
-val_loader = DataLoader(val_set, batch_size=config['batch_size'])
+X_raw = data[:TRAIN_SAMPLES + VAL_SAMPLES, 0].unsqueeze(1)
+Y = data[:TRAIN_SAMPLES + VAL_SAMPLES, 1].unsqueeze(1)
+X = augment_with_params(X_raw)
+train_set, val_set = random_split(TensorDataset(X, Y), [TRAIN_SAMPLES, VAL_SAMPLES])
+train_loader = DataLoader(train_set, batch_size=BATCH_SIZE, shuffle=True)
+val_loader = DataLoader(val_set, batch_size=BATCH_SIZE)
+print("[Step] Dataset ready")
 
-# === FNO MODULES ===
+# === SPECTRAL CONV2D ===
 class SpectralConv2d(nn.Module):
     def __init__(self, in_channels, out_channels, modes):
         super().__init__()
@@ -35,130 +49,106 @@ class SpectralConv2d(nn.Module):
         self.modes = modes
         self.scale = 1 / (in_channels * out_channels)
         self.weights = nn.Parameter(
-            self.scale * torch.randn(in_channels, out_channels, modes, modes, 2)
+            self.scale * torch.randn(in_channels, out_channels, modes, modes, dtype=torch.cfloat)
         )
 
     def compl_mul2d(self, input, weights):
-        if weights.dtype in (torch.complex64, torch.complex128):
-            weights_c = weights
-        else:
-            weights_c = torch.view_as_complex(weights)
-        return torch.einsum("bixy,ioxy->boxy", input, weights_c)
+        return torch.einsum("bixy,ioxy->boxy", input, weights)
 
     def forward(self, x):
         B, C, H, W = x.shape
-        x_ft = torch.fft.rfft2(x, norm='ortho')
-        modes_x = min(self.modes, x_ft.size(-2))          # e.g. 32
-        modes_y = min(self.modes, x_ft.size(-1))          # e.g. 17
-
-        out_ft = torch.zeros(B, self.out_channels, H, W//2 + 1, dtype=torch.cfloat, device=x.device)
-        out_ft[:, :, :modes_x, :modes_y] = self.compl_mul2d(
-            x_ft[:, :, :modes_x, :modes_y],
-            self.weights[:, :, :modes_x, :modes_y]
-        )
-        x = torch.fft.irfft2(out_ft, s=(H, W), norm='ortho')
+        x_ft = torch.fft.rfft2(x)
+        Hf, Wf = x_ft.shape[-2], x_ft.shape[-1]
+        mh = min(self.modes, Hf)
+        mw = min(self.modes, Wf)
+        out_ft = torch.zeros(B, self.out_channels, Hf, Wf, dtype=torch.cfloat, device=x.device)
+        out_ft[:, :, :mh, :mw] = self.compl_mul2d(x_ft[:, :, :mh, :mw], self.weights[:, :, :mh, :mw])
+        x = torch.fft.irfft2(out_ft, s=(H, W))
         return x
 
-
+# === FNO2D MODEL (RELU version) ===
 class FNO2D(nn.Module):
-    def __init__(self, modes, width):
+    def __init__(self, modes=MODES, width=WIDTH):
         super().__init__()
-        self.modes = modes
-        self.width = width
+        self.fc0 = nn.Conv2d(3, width, 1)
 
-        self.fc0 = nn.Conv2d(1, width, 1)
+        self.spec1 = SpectralConv2d(width, width, modes)
+        self.spec2 = SpectralConv2d(width, width, modes)
+        self.spec3 = SpectralConv2d(width, width, modes)
+        self.spec4 = SpectralConv2d(width, width, modes)
 
-        self.conv1 = SpectralConv2d(width, width, modes)
         self.w1 = nn.Conv2d(width, width, 1)
-
-        self.conv2 = SpectralConv2d(width, width, modes)
         self.w2 = nn.Conv2d(width, width, 1)
-
-        self.conv3 = SpectralConv2d(width, width, modes)
         self.w3 = nn.Conv2d(width, width, 1)
-
-        self.conv4 = SpectralConv2d(width, width, modes)
         self.w4 = nn.Conv2d(width, width, 1)
 
-        self.fc1 = nn.Conv2d(width, 128, 1)
-        self.fc2 = nn.Conv2d(128, 1, 1)
+        self.bn1 = nn.BatchNorm2d(width)
+        self.bn2 = nn.BatchNorm2d(width)
+        self.bn3 = nn.BatchNorm2d(width)
+        self.bn4 = nn.BatchNorm2d(width)
+
+        self.fc1 = nn.Conv2d(width, 32, 1)
+        self.fc2 = nn.Conv2d(32, 1, 1)
 
     def forward(self, x):
         x = self.fc0(x)
-
-        x1 = self.conv1(x) + self.w1(x)
-        x2 = self.conv2(x1) + self.w2(x1)
-        x3 = self.conv3(x2) + self.w3(x2)
-        x4 = self.conv4(x3) + self.w4(x3)
-
-        x = torch.relu(x4)
-        x = torch.relu(self.fc1(x))
+        x = self.bn1(F.relu(self.spec1(x) + self.w1(x)))
+        x = self.bn2(F.relu(self.spec2(x) + self.w2(x)))
+        x = self.bn3(F.relu(self.spec3(x) + self.w3(x)))
+        x = self.bn4(F.relu(self.spec4(x) + self.w4(x)))
+        x = F.relu(self.fc1(x))
         x = self.fc2(x)
         return x
 
-# === TRAIN / EVAL ===
-def train(model, loader, optimizer, loss_fn):
-    model.train()
+# === MODEL TRAINING ===
+print("[Step] Starting float32 training...")
+model = FNO2D().to(device).train()
+optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+loss_fn = nn.MSELoss()
+
+for epoch in range(EPOCHS):
     total_loss = 0.0
-    for xb, yb in loader:
+    for xb, yb in train_loader:
         xb, yb = xb.to(device), yb.to(device)
         optimizer.zero_grad()
         pred = model(xb)
         loss = loss_fn(pred, yb)
         loss.backward()
         optimizer.step()
-        total_loss += loss.item() * xb.size(0)
-    return total_loss / len(loader.dataset)
+        total_loss += loss.item()
+    print(f"[Epoch {epoch+1}] Train Loss: {total_loss / len(train_loader):.6f}")
+print("[Step] Training complete")
 
-def evaluate(model, loader):
-    model.eval()
-    total_loss = 0.0
-    times = []
-    with torch.no_grad():
-        for xb, yb in loader:
-            xb, yb = xb.to(device), yb.to(device)
-            torch.cuda.synchronize() if torch.cuda.is_available() else None
-            t0 = time.time()
-            pred = model(xb)
-            torch.cuda.synchronize() if torch.cuda.is_available() else None
-            times.append(time.time() - t0)
-            rel_err = (torch.norm(pred - yb) / torch.norm(yb)).item()
-            total_loss += rel_err * xb.size(0)
-    return total_loss / len(loader.dataset), sum(times) / len(times)
+# === CPU INFERENCE ===
+print("[Step] Running float32 inference on CPU...")
+model.cpu().eval()
 
-# === RUN TRAINING ===
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-model = FNO2D(config['modes'], config['width']).to(device)
-optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
-loss_fn = nn.MSELoss()
+total_rel_err = 0.0
+total_time = 0.0
+total_samples = 0
 
-train_errs, val_errs, inf_times = [], [], []
+with torch.no_grad():
+    for i, (xb, yb) in enumerate(val_loader):
+        start = time.time()
+        pred = model(xb)
+        end = time.time()
 
-for ep in range(config['epochs']):
-    train_loss = train(model, train_loader, optimizer, loss_fn)
-    val_err, val_time = evaluate(model, val_loader)
-    train_errs.append(train_loss)
-    val_errs.append(val_err)
-    inf_times.append(val_time)
-    print(f"[Epoch {ep+1}] Train Loss: {train_loss:.6f} | Val RelErr: {val_err:.6f} | Inference Time: {val_time*1000:.2f} ms")
+        elapsed = (end - start) * 1000  # ms
+        batch_size = xb.size(0)
+        per_sample = elapsed / batch_size
 
-# === PLOT CURVES ===
-plt.figure()
-plt.plot(train_errs, label='Train Loss')
-plt.plot(val_errs, label='Val Rel. Error')
-plt.xlabel("Epoch")
-plt.title("Loss / Relative Error")
-plt.legend()
-plt.tight_layout()
-plt.savefig("fno_ns2d_train_curve.png", dpi=300)
+        rel_err = (torch.norm(pred - yb) / torch.norm(yb)).item()
+        total_rel_err += rel_err
+        total_time += elapsed
+        total_samples += batch_size
 
-# === SAVE MODEL ===
-torch.save(model.state_dict(), "fno_ns2d_model.pth")
-print("Saved model and curve.")
+        print(f"[Batch {i+1}] Time: {elapsed:.2f} ms | Per sample: {per_sample:.4f} ms | RelErr: {rel_err:.6f}")
 
-# === Final Evaluation ===
-final_val_err, final_inference_time = evaluate(model, val_loader)
-print("\n=== Baseline Final Evaluation ===")
-print(f"Final Relative L2 Error: {final_val_err:.6f}")
-print(f"Inference Time per batch: {final_inference_time * 1000:.4f} ms")
-print(f"Inference Time per sample: {(final_inference_time / config['batch_size']) * 1000:.4f} ms")
+avg_rel_err = total_rel_err / len(val_loader)
+avg_batch_time = total_time / len(val_loader)
+avg_sample_time = total_time / total_samples
+
+print("\n[Step] Float32 Evaluation Summary")
+print(f"Avg Relative L2 Error: {avg_rel_err:.6f}")
+print(f"Avg Inference Time (batch): {avg_batch_time:.2f} ms")
+print(f"Avg Inference Time (sample): {avg_sample_time:.4f} ms")
