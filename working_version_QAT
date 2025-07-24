@@ -1,180 +1,209 @@
+# === IMPORTS ===
 import torch
 import torch.nn as nn
-import torch.optim as optim
-import torch.quantization as quant
+import torch.nn.functional as F
+import torch.fft
+import copy
+import inspect
+import time
+import warnings
 from torch.utils.data import DataLoader, TensorDataset, random_split
-import matplotlib.pyplot as plt
-import time, os
+import torch.ao.quantization.quantize_fx as quantize_fx
+from torch.ao.quantization import get_default_qat_qconfig_mapping
 
-# === CONFIG ===
-config = {
-    'modes': 32,
-    'width': 256,
-    'epochs': 500,
-    'batch_size': 128,
-    'dt': 0.0208,
-    'nu': 1e-4,
-    'grid_size': 32,
-    'train_samples': 9000,
-    'val_samples': 1000,
-    'lr': 1e-3
-}
+warnings.filterwarnings("ignore", message=".*quant_min and quant_max.*")
 
-# === Quant Engine Selection ===
-if 'fbgemm' in torch.backends.quantized.supported_engines:
-    torch.backends.quantized.engine = 'fbgemm'
-elif 'qnnpack' in torch.backends.quantized.supported_engines:
-    torch.backends.quantized.engine = 'qnnpack'
-else:
-    raise RuntimeError("No quantized engine available.")
-print(f"Using quantized engine: {torch.backends.quantized.engine}")
+# === FAST CONFIG FOR DEBUG ===
+BATCH_SIZE = 128
+TRAIN_SAMPLES = 9000
+VAL_SAMPLES = 1000
+MODES = 32
+WIDTH = 256
+EPOCHS = 500
+DT = 0.0208
+NU = 1e-4
 
-# === Load Dataset ===
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"[Device] Training on: {device}")
+
+# === PARAM AUGMENTATION FUNCTION ===
+def augment_with_params(X, dt=DT, nu=NU):
+    B, _, H, W = X.shape
+    dt_channel = torch.full((B, 1, H, W), dt, dtype=X.dtype, device=X.device)
+    nu_channel = torch.full((B, 1, H, W), nu, dtype=X.dtype, device=X.device)
+    return torch.cat([X, dt_channel, nu_channel], dim=1)
+
+# === LOAD DATA ===
+print("[Step] Loading synthetic dataset (debug slice)...")
 data = torch.load("synthetic_data_ns2d/synthetic_data.pt")
-X = data[:, 0].unsqueeze(1)
-Y = data[:, 1].unsqueeze(1)
-train_set, val_set = random_split(TensorDataset(X, Y), [config['train_samples'], config['val_samples']])
-train_loader = DataLoader(train_set, batch_size=config['batch_size'], shuffle=True)
-test_loader = DataLoader(val_set, batch_size=config['batch_size'], shuffle=False)
+X_raw = data[:TRAIN_SAMPLES + VAL_SAMPLES, 0].unsqueeze(1)
+Y = data[:TRAIN_SAMPLES + VAL_SAMPLES, 1].unsqueeze(1)
+X = augment_with_params(X_raw)  # Now has 3 channels
+train_set, val_set = random_split(TensorDataset(X, Y), [TRAIN_SAMPLES, VAL_SAMPLES])
+train_loader = DataLoader(train_set, batch_size=BATCH_SIZE, shuffle=True)
+val_loader = DataLoader(val_set, batch_size=BATCH_SIZE)
+print("[Step] Dataset loaded ")
 
-# === Define QAT-Compatible FNO ===
-class FourierLayer(nn.Module):
-    def __init__(self, channels, modes):
+# === SPECTRAL CONV2D ===
+class SpectralConv2d(nn.Module):
+    def __init__(self, in_channels, out_channels, modes):
         super().__init__()
-        self.channels = channels
+        self.in_channels = in_channels
+        self.out_channels = out_channels
         self.modes = modes
-        self.weight = nn.Parameter(torch.randn(channels, channels, modes, modes, 2) * 0.1)
+        self.scale = 1 / (in_channels * out_channels)
+        self.weights = nn.Parameter(
+            self.scale * torch.randn(in_channels, out_channels, modes, modes, dtype=torch.cfloat)
+        )
 
-    def compl_mul2d(self, x_ft, w):
-        if w.dtype in (torch.complex64, torch.complex128):
-            w_c = w
-        else:
-            w_c = torch.view_as_complex(w)
-        return torch.einsum("bixy,ioxy->boxy", x_ft, w_c)
+    def compl_mul2d(self, input, weights):
+        return torch.einsum("bixy,ioxy->boxy", input, weights)
 
     def forward(self, x):
-        if x.dtype in (torch.quint8, torch.qint8, torch.qint32):
-            x = x.dequantize()
-        x_ft = torch.fft.rfft2(x, norm='ortho')
-        B, C, H, W2 = x_ft.shape
-        modes_x = min(self.modes, H)
-        modes_y = min(self.modes, W2)
-        out_ft = torch.zeros(B, self.channels, H, W2, dtype=torch.cfloat, device=x.device)
-        out_ft[:, :, :modes_x, :modes_y] = self.compl_mul2d(
-            x_ft[:, :, :modes_x, :modes_y],
-            self.weight[:, :, :modes_x, :modes_y]
+        B, C, H, W = x.shape
+        x_ft = torch.fft.rfft2(x)
+        Hf, Wf = x_ft.shape[-2], x_ft.shape[-1]
+        mh = min(self.modes, Hf)
+        mw = min(self.modes, Wf)
+        out_ft = torch.zeros(B, self.out_channels, Hf, Wf, dtype=torch.cfloat, device=x.device)
+        out_ft[:, :, :mh, :mw] = self.compl_mul2d(
+            x_ft[:, :, :mh, :mw], self.weights[:, :, :mh, :mw]
         )
-        x = torch.fft.irfft2(out_ft, s=x.shape[-2:], norm='ortho')
+        x = torch.fft.irfft2(out_ft, s=(H, W))
         return x
 
-class SimpleFNO_NS(nn.Module):
-    def __init__(self, modes, width):
+# === FNO2D MODEL ===
+class FNO2D(nn.Module):
+    def __init__(self, modes=MODES, width=WIDTH):
         super().__init__()
-        self.fc0   = nn.Sequential(nn.Conv2d(1, width, 1), nn.ReLU())
-        self.fno1  = nn.Sequential(FourierLayer(width, modes), nn.ReLU())
-        self.fno2  = nn.Sequential(FourierLayer(width, modes), nn.ReLU())
-        self.fno3  = nn.Sequential(FourierLayer(width, modes), nn.ReLU())
-        self.fno4  = nn.Sequential(FourierLayer(width, modes), nn.ReLU())
-        self.fc1   = nn.Sequential(nn.Conv2d(width, width, 1), nn.ReLU())
-        self.fc2   = nn.Conv2d(width, 1, 1)
+        self.fc0 = nn.Conv2d(3, width, 1)  # Changed from 1 to 3 input channels
+
+        self.spec1 = SpectralConv2d(width, width, modes)
+        self.spec2 = SpectralConv2d(width, width, modes)
+        self.spec3 = SpectralConv2d(width, width, modes)
+        self.spec4 = SpectralConv2d(width, width, modes)
+
+        self.w1 = nn.Conv2d(width, width, 1)
+        self.w2 = nn.Conv2d(width, width, 1)
+        self.w3 = nn.Conv2d(width, width, 1)
+        self.w4 = nn.Conv2d(width, width, 1)
+
+        self.bn1 = nn.BatchNorm2d(width)
+        self.bn2 = nn.BatchNorm2d(width)
+        self.bn3 = nn.BatchNorm2d(width)
+        self.bn4 = nn.BatchNorm2d(width)
+
+        self.fc1 = nn.Conv2d(width, 32, 1)
+        self.fc2 = nn.Conv2d(32, 1, 1)
 
     def forward(self, x):
         x = self.fc0(x)
-        x = self.fno1(x)
-        x = self.fno2(x)
-        x = self.fno3(x)
-        x = self.fno4(x)
-        x = self.fc1(x)
-        delta = self.fc2(x)
-        return delta
+        x = self.bn1(F.gelu(self.spec1(x) + self.w1(x)))
+        x = self.bn2(F.gelu(self.spec2(x) + self.w2(x)))
+        x = self.bn3(F.gelu(self.spec3(x) + self.w3(x)))
+        x = self.bn4(F.gelu(self.spec4(x) + self.w4(x)))
+        x = F.gelu(self.fc1(x))
+        x = self.fc2(x)
+        return x
 
-class QuantizedFNO(nn.Module):
-    def __init__(self, modes, width):
-        super().__init__()
-        self.quant   = quant.QuantStub()
-        self.model   = SimpleFNO_NS(modes, width)
-        self.dequant = quant.DeQuantStub()
+# === FX PATCH FOR SpectralConv2d ===
+from torch.ao.quantization.quantize_fx import prepare_qat_fx
+QuantizationTracer = prepare_qat_fx.__globals__["QuantizationTracer"]
 
-    def forward(self, x):
-        x = self.quant(x)
-        delta = self.model(x)
-        return self.dequant(x + delta)
+if not hasattr(QuantizationTracer, "_original_leaf"):
+    QuantizationTracer._original_leaf = QuantizationTracer.is_leaf_module
+    sig = inspect.signature(QuantizationTracer._original_leaf)
+    param_count = len(sig.parameters)
 
-# === Train / Test ===
-def train_epoch(model, loader, optimizer, loss_fn, device):
-    model.train()
-    total = 0.0
-    for xb, yb in loader:
+    if param_count == 3:
+        def custom_is_leaf_module(self, module, module_qualified_name):
+            if isinstance(module, SpectralConv2d):
+                return True
+            return QuantizationTracer._original_leaf(self, module, module_qualified_name)
+    elif param_count == 5:
+        def custom_is_leaf_module(self, module, module_qualified_name, graph, is_qat):
+            if isinstance(module, SpectralConv2d):
+                return True
+            return QuantizationTracer._original_leaf(self, module, module_qualified_name, graph, is_qat)
+    else:
+        raise RuntimeError("Unsupported is_leaf_module signature.")
+
+    QuantizationTracer.is_leaf_module = custom_is_leaf_module
+
+# === QAT SETUP ===
+print("[Step] Setting up QAT configuration...")
+torch.backends.quantized.engine = 'x86'
+model_fp32 = FNO2D().train()
+example_inputs = (X[0:1],)
+qconfig_mapping = get_default_qat_qconfig_mapping('x86')
+print("[Step] QAT configuration ready ")
+
+# === FX TRACING ===
+print("[Step] Starting prepare_qat_fx (FX symbolic tracing)...")
+t0 = time.time()
+prepared_model = prepare_qat_fx(copy.deepcopy(model_fp32), qconfig_mapping, example_inputs)
+print(f"[Step] prepare_qat_fx complete in {time.time() - t0:.2f} seconds")
+
+# === MOVE MODEL TO GPU FOR QAT TRAINING ===
+print("[Step] Moving model to GPU for QAT training...")
+prepared_model.to(device)
+
+# === QAT TRAINING ===
+print("[Step] Starting QAT training on GPU...")
+optimizer = torch.optim.Adam(prepared_model.parameters(), lr=1e-3)
+loss_fn = nn.MSELoss()
+
+for epoch in range(EPOCHS):
+    prepared_model.train()
+    total_loss = 0.0
+    for xb, yb in train_loader:
         xb, yb = xb.to(device), yb.to(device)
         optimizer.zero_grad()
-        pred = model(xb)
+        pred = prepared_model(xb)
         loss = loss_fn(pred, yb)
         loss.backward()
         optimizer.step()
-        total += loss.item() * xb.size(0)
-    return total / len(loader.dataset)
+        total_loss += loss.item()
+    print(f"[Epoch {epoch+1}] QAT Loss: {total_loss / len(train_loader):.6f}")
+print("[Step] QAT training complete")
 
-def test_model_and_time(model, loader, device):
-    model.eval()
-    errs = []
-    times = []
-    with torch.no_grad():
-        for xb, yb in loader:
-            xb, yb = xb.to(device), yb.to(device)
-            torch.cuda.synchronize() if device.type == 'cuda' else None
-            t0 = time.time()
-            pred = model(xb)
-            torch.cuda.synchronize() if device.type == 'cuda' else None
-            times.append(time.time() - t0)
-            rel_err = (torch.norm(pred - yb) / torch.norm(yb)).item()
-            errs.append(rel_err)
-    return sum(errs)/len(errs), sum(times)/len(times)
+# === CONVERT TO INT8 ===
+print("[Step] Converting to INT8 quantized model on CPU...")
+prepared_model.cpu()
+quantized_model = quantize_fx.convert_fx(prepared_model)
+print("[Step] INT8 model conversion complete")
 
-# === QAT Training ===
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print(f"Running on device: {device}")
+# === INT8 EVALUATION ===
+print("[Step] Running INT8 inference on CPU")
+quantized_model.eval()
 
-model_qat = QuantizedFNO(config['modes'], config['width']).to(device)
-model_qat.qconfig = quant.get_default_qat_qconfig('fbgemm')
-quant.prepare_qat(model_qat, inplace=True)
+total_rel_err = 0.0
+total_time = 0.0
+total_samples = 0
 
-optimizer = optim.Adam(model_qat.parameters(), lr=config['lr'])
-loss_fn = nn.MSELoss()
-train_losses, test_errors, inf_times = [], [], []
+with torch.no_grad():
+    for i, (xb, yb) in enumerate(val_loader):
+        start = time.time()
+        pred = quantized_model(xb)
+        end = time.time()
 
-for ep in range(1, config['epochs'] + 1):
-    tr_loss = train_epoch(model_qat, train_loader, optimizer, loss_fn, device)
-    val_err, val_time = test_model_and_time(model_qat, test_loader, device)
-    train_losses.append(tr_loss)
-    test_errors.append(val_err)
-    inf_times.append(val_time)
-    print(f"[Epoch {ep}] Train Loss: {tr_loss:.6f} | Val RelErr: {val_err:.6f} | Inference Time: {val_time * 1000:.2f} ms")
+        elapsed = (end - start) * 1000  # milliseconds
+        batch_size = xb.size(0)
+        per_sample = elapsed / batch_size
 
-# === Plot ===
-plt.figure()
-plt.plot(range(1, config['epochs'] + 1), train_losses, label='Train Loss')
-plt.plot(range(1, config['epochs'] + 1), test_errors,  label='Test Rel. Error')
-plt.xlabel("Epoch")
-plt.ylabel("Loss / Error")
-plt.title("QAT Training Curve")
-plt.legend()
-plt.grid(True)
-plt.tight_layout()
-plt.savefig("qat_training_curve.png", dpi=300)
+        rel_err = (torch.norm(pred - yb) / torch.norm(yb)).item()
+        total_rel_err += rel_err
+        total_time += elapsed
+        total_samples += batch_size
 
-# === Save Model ===
-torch.save(model_qat.state_dict(), "qat_fno_ns2d_float.pth")
-print("Saved QAT-trained float model to qat_fno_ns2d_float.pth")
+        print(f"[Batch {i+1}] Time: {elapsed:.2f} ms | Per sample: {per_sample:.4f} ms | RelErr: {rel_err:.6f}")
 
-# === Final Evaluation ===
-print("\n=== QAT Final Evaluation ===")
-final_rel_err, inference_time = test_model_and_time(model_qat, test_loader, device)
-print(f"Final Relative L2 Error: {final_rel_err:.6f}")
-print(f"Inference Time per batch ({device.type.upper()}): {inference_time * 1000:.4f} ms")
-print(f"Inference Time per sample: {(inference_time / config['batch_size']) * 1000:.4f} ms")
+avg_rel_err = total_rel_err / len(val_loader)
+avg_batch_time = total_time / len(val_loader)
+avg_sample_time = total_time / total_samples
 
-# === Hybrid Quantization Convert (Partial) ===
-model_qat.eval().cpu()
-quant.convert(model_qat, inplace=True)
-torch.save(model_qat.state_dict(), "qat_fno_ns2d_hybrid_int8.pth")
-print("Saved partially quantized hybrid QAT model to qat_fno_ns2d_hybrid_int8.pth")
+print("\n[Step] INT8 Evaluation Summary ")
+print(f"Avg Relative L2 Error: {avg_rel_err:.6f}")
+print(f"Avg Inference Time (batch): {avg_batch_time:.2f} ms")
+print(f"Avg Inference Time (sample): {avg_sample_time:.4f} ms")
+
