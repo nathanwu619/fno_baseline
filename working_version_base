@@ -1,24 +1,15 @@
 import torch
 import torch.nn as nn
-import torch.fft as fft
-import torch.nn.functional as F
+import torch.fft
 from torch.utils.data import DataLoader, TensorDataset, random_split
-import time
-import os
-import csv
-from datetime import datetime
-import sys
+import matplotlib.pyplot as plt
+import time, os
 
-if not torch.cuda.is_available():
-    print("CUDA not available. Please ensure your GPU is properly configured.")
-    sys.exit(1)
-else:
-    print(f"CUDA available. Using GPU: {torch.cuda.get_device_name(0)}")
-
-base_config = {
+# === CONFIG ===
+config = {
     'modes': 32,
     'width': 256,
-    'epochs': 3,  # CHANGED FROM 10 TO 3
+    'epochs': 500,
     'batch_size': 128,
     'dt': 0.0208,
     'nu': 1e-4,
@@ -27,109 +18,147 @@ base_config = {
     'val_samples': 1000
 }
 
+# === LOAD DATA ===
+data = torch.load("synthetic_data_ns2d/synthetic_data.pt")
+X = data[:, 0].unsqueeze(1)  # [N, 1, 32, 32]
+Y = data[:, 1].unsqueeze(1)  # [N, 1, 32, 32]
+train_set, val_set = random_split(TensorDataset(X, Y), [config['train_samples'], config['val_samples']])
+train_loader = DataLoader(train_set, batch_size=config['batch_size'], shuffle=True)
+val_loader = DataLoader(val_set, batch_size=config['batch_size'])
+
+# === FNO MODULES ===
 class SpectralConv2d(nn.Module):
     def __init__(self, in_channels, out_channels, modes):
         super().__init__()
-        self.weights = nn.Parameter((1 / (in_channels * out_channels)) *
-                                    torch.rand(in_channels, out_channels, modes, modes, dtype=torch.cfloat))
+        self.in_channels = in_channels
+        self.out_channels = out_channels
         self.modes = modes
+        self.scale = 1 / (in_channels * out_channels)
+        self.weights = nn.Parameter(
+            self.scale * torch.randn(in_channels, out_channels, modes, modes, 2)
+        )
 
     def compl_mul2d(self, input, weights):
-        return torch.einsum("bixy, ioxy -> boxy", input, weights)
+        if weights.dtype in (torch.complex64, torch.complex128):
+            weights_c = weights
+        else:
+            weights_c = torch.view_as_complex(weights)
+        return torch.einsum("bixy,ioxy->boxy", input, weights_c)
 
     def forward(self, x):
         B, C, H, W = x.shape
-        x_ft = fft.fft2(x, norm="ortho")
-        x_ft = x_ft[:, :, :self.modes, :self.modes]
-        out_ft = torch.zeros(B, self.weights.shape[1], H, W, dtype=torch.cfloat, device=x.device)
-        out_ft[:, :, :self.modes, :self.modes] = self.compl_mul2d(x_ft, self.weights)
-        return fft.ifft2(out_ft, norm="ortho").real
+        x_ft = torch.fft.rfft2(x, norm='ortho')
+        modes_x = min(self.modes, x_ft.size(-2))          # e.g. 32
+        modes_y = min(self.modes, x_ft.size(-1))          # e.g. 17
+
+        out_ft = torch.zeros(B, self.out_channels, H, W//2 + 1, dtype=torch.cfloat, device=x.device)
+        out_ft[:, :, :modes_x, :modes_y] = self.compl_mul2d(
+            x_ft[:, :, :modes_x, :modes_y],
+            self.weights[:, :, :modes_x, :modes_y]
+        )
+        x = torch.fft.irfft2(out_ft, s=(H, W), norm='ortho')
+        return x
+
 
 class FNO2D(nn.Module):
     def __init__(self, modes, width):
         super().__init__()
-        self.fc0 = nn.Linear(1, width)
+        self.modes = modes
+        self.width = width
+
+        self.fc0 = nn.Conv2d(1, width, 1)
+
         self.conv1 = SpectralConv2d(width, width, modes)
-        self.conv2 = SpectralConv2d(width, width, modes)
         self.w1 = nn.Conv2d(width, width, 1)
+
+        self.conv2 = SpectralConv2d(width, width, modes)
         self.w2 = nn.Conv2d(width, width, 1)
-        self.fc1 = nn.Linear(width, 128)
-        self.fc2 = nn.Linear(128, 1)
+
+        self.conv3 = SpectralConv2d(width, width, modes)
+        self.w3 = nn.Conv2d(width, width, 1)
+
+        self.conv4 = SpectralConv2d(width, width, modes)
+        self.w4 = nn.Conv2d(width, width, 1)
+
+        self.fc1 = nn.Conv2d(width, 128, 1)
+        self.fc2 = nn.Conv2d(128, 1, 1)
 
     def forward(self, x):
-        x = self.fc0(x.unsqueeze(-1)).permute(0, 3, 1, 2)
-        x = F.relu(self.conv1(x) + self.w1(x))  # CHANGED TO RELU
-        x = F.relu(self.conv2(x) + self.w2(x))  # CHANGED TO RELU
-        x = x.permute(0, 2, 3, 1)
-        return self.fc2(F.relu(self.fc1(x))).squeeze(-1)  # CHANGED TO RELU
+        x = self.fc0(x)
 
-def classification_error(pred, yb):
-    pred_classes = torch.round(pred)
-    true_classes = torch.round(yb)
-    num_correct = (pred_classes == true_classes).sum().item()
-    num_total = yb.numel()
-    return (num_total - num_correct) / num_total
+        x1 = self.conv1(x) + self.w1(x)
+        x2 = self.conv2(x1) + self.w2(x1)
+        x3 = self.conv3(x2) + self.w3(x2)
+        x4 = self.conv4(x3) + self.w4(x3)
 
-def run_single_config(config):
-    train_device = torch.device('cuda')
-    print(f"Training on device: {train_device} ({torch.cuda.get_device_name(0)})")
+        x = torch.relu(x4)
+        x = torch.relu(self.fc1(x))
+        x = self.fc2(x)
+        return x
 
-    data = torch.load('synthetic_data_ns2d/synthetic_data.pt')
-    total_needed = config['train_samples'] + config['val_samples']
-    x_all, y_all = data[:total_needed, 0], data[:total_needed, 1]
-
-    dataset = TensorDataset(x_all, y_all)
-    generator = torch.Generator().manual_seed(42)
-    train_set, val_set = random_split(dataset, [config['train_samples'], config['val_samples']], generator=generator)
-    train_loader = DataLoader(train_set, batch_size=config['batch_size'], shuffle=True)
-    val_loader = DataLoader(val_set, batch_size=config['batch_size'], shuffle=False)
-
-    model = FNO2D(config['modes'], config['width']).to(train_device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
-    loss_fn = nn.MSELoss()
-
-    os.makedirs("logs", exist_ok=True)
-    csv_path = "logs/baseline_training_log.csv"
-    with open(csv_path, "w", newline='') as f:
-        csv.writer(f).writerow(["Epoch", "Train Loss", "Time (s)"])
-
-    print("Starting training...")
-    for ep in range(config['epochs']):
-        model.train()
-        total_loss = 0
-        start_ep = time.time()
-        for xb, yb in train_loader:
-            xb, yb = xb.to(train_device), yb.to(train_device)
-            optimizer.zero_grad()
-            loss = loss_fn(model(xb), yb)
-            loss.backward()
-            optimizer.step()
-            total_loss += loss.item()
-        duration = time.time() - start_ep
-        avg_loss = total_loss / len(train_loader)
-        with open(csv_path, "a", newline='') as f:
-            csv.writer(f).writerow([ep + 1, avg_loss, duration])
-        print(f"[Epoch {ep+1}] Train Loss: {avg_loss:.6f} | Time: {duration:.2f}s")
-
-    model.eval()
-    model.to('cpu')
-    xb, yb = next(iter(val_loader))
-    xb, yb = xb.to('cpu'), yb.to('cpu')
-
-    start = time.time()
-    with torch.no_grad():
+# === TRAIN / EVAL ===
+def train(model, loader, optimizer, loss_fn):
+    model.train()
+    total_loss = 0.0
+    for xb, yb in loader:
+        xb, yb = xb.to(device), yb.to(device)
+        optimizer.zero_grad()
         pred = model(xb)
-    end = time.time()
+        loss = loss_fn(pred, yb)
+        loss.backward()
+        optimizer.step()
+        total_loss += loss.item() * xb.size(0)
+    return total_loss / len(loader.dataset)
 
-    infer_time = (end - start) / len(xb)
-    rel_err = classification_error(pred, yb)
-    score = rel_err * (infer_time * 1000)
+def evaluate(model, loader):
+    model.eval()
+    total_loss = 0.0
+    times = []
+    with torch.no_grad():
+        for xb, yb in loader:
+            xb, yb = xb.to(device), yb.to(device)
+            torch.cuda.synchronize() if torch.cuda.is_available() else None
+            t0 = time.time()
+            pred = model(xb)
+            torch.cuda.synchronize() if torch.cuda.is_available() else None
+            times.append(time.time() - t0)
+            rel_err = (torch.norm(pred - yb) / torch.norm(yb)).item()
+            total_loss += rel_err * xb.size(0)
+    return total_loss / len(loader.dataset), sum(times) / len(times)
 
-    print(f"\n === Baseline FNO CPU Inference ===")
-    print(f"Relative Error: {rel_err:.4e}")
-    print(f"Inference Time per sample (on CPU): {infer_time:.4e} seconds")
-    print(f"Score (RelErr × Time × 1000): {score:.4e}")
-    print(f"Training log saved to {csv_path}")
+# === RUN TRAINING ===
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+model = FNO2D(config['modes'], config['width']).to(device)
+optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+loss_fn = nn.MSELoss()
 
-# === RUN ===
-run_single_config(base_config)
+train_errs, val_errs, inf_times = [], [], []
+
+for ep in range(config['epochs']):
+    train_loss = train(model, train_loader, optimizer, loss_fn)
+    val_err, val_time = evaluate(model, val_loader)
+    train_errs.append(train_loss)
+    val_errs.append(val_err)
+    inf_times.append(val_time)
+    print(f"[Epoch {ep+1}] Train Loss: {train_loss:.6f} | Val RelErr: {val_err:.6f} | Inference Time: {val_time*1000:.2f} ms")
+
+# === PLOT CURVES ===
+plt.figure()
+plt.plot(train_errs, label='Train Loss')
+plt.plot(val_errs, label='Val Rel. Error')
+plt.xlabel("Epoch")
+plt.title("Loss / Relative Error")
+plt.legend()
+plt.tight_layout()
+plt.savefig("fno_ns2d_train_curve.png", dpi=300)
+
+# === SAVE MODEL ===
+torch.save(model.state_dict(), "fno_ns2d_model.pth")
+print("Saved model and curve.")
+
+# === Final Evaluation ===
+final_val_err, final_inference_time = evaluate(model, val_loader)
+print("\n=== Baseline Final Evaluation ===")
+print(f"Final Relative L2 Error: {final_val_err:.6f}")
+print(f"Inference Time per batch: {final_inference_time * 1000:.4f} ms")
+print(f"Inference Time per sample: {(final_inference_time / config['batch_size']) * 1000:.4f} ms")
