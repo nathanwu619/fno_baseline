@@ -1,0 +1,174 @@
+import torch
+import torch.nn as nn
+import torch.fft
+import time
+import copy
+import inspect
+from torch.utils.data import DataLoader, TensorDataset, random_split
+import torch.ao.quantization.quantize_fx as quantize_fx
+from torch.ao.quantization import QConfigMapping
+from torch.ao.quantization.qconfig import QConfig
+from torch.ao.quantization.fake_quantize import default_fake_quant, default_weight_fake_quant
+
+# configurations
+torch.backends.quantized.engine = 'fbgemm'  # or 'fbgemm' if supported
+BATCH_SIZE = 256
+TRAIN_SAMPLES = 9000
+VAL_SAMPLES = 1000
+MODES = 16
+WIDTH = 128
+EPOCHS = 500
+DT = 0.0208
+NU = 1e-4
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# loading data
+def augment_with_params(X, dt=DT, nu=NU):
+    B, _, H, W = X.shape
+    dt_channel = torch.full((B, 1, H, W), dt, dtype=X.dtype, device=X.device)
+    nu_channel = torch.full((B, 1, H, W), nu, dtype=X.dtype, device=X.device)
+    return torch.cat([X, dt_channel, nu_channel], dim=1)
+
+data = torch.load("synthetic_data_ns2d/synthetic_data.pt")
+X_raw = data[:TRAIN_SAMPLES + VAL_SAMPLES, 0].unsqueeze(1)
+Y = data[:TRAIN_SAMPLES + VAL_SAMPLES, 1].unsqueeze(1)
+X = augment_with_params(X_raw)
+train_set, val_set = random_split(TensorDataset(X, Y), [TRAIN_SAMPLES, VAL_SAMPLES])
+train_loader = DataLoader(train_set, batch_size=BATCH_SIZE, shuffle=True)
+val_loader = DataLoader(val_set, batch_size=BATCH_SIZE)
+
+# specconv2d
+class SpectralConv2d(nn.Module):
+    def __init__(self, in_channels, out_channels, modes):
+        super().__init__()
+        self.weights = nn.Parameter(torch.randn(in_channels, out_channels, modes, modes, dtype=torch.cfloat))
+
+    def compl_mul2d(self, input, weights):
+        return torch.einsum("bixy,ioxy->boxy", input, weights)
+
+    def forward(self, x):
+        B, C, H, W = x.shape
+        x_ft = torch.fft.rfft2(x)
+        Hf, Wf = x_ft.shape[-2], x_ft.shape[-1]
+        mh, mw = self.weights.shape[-2:]
+        mh = min(mh, Hf)
+        mw = min(mw, Wf)
+        out_ft = torch.zeros(B, self.weights.size(1), Hf, Wf, dtype=torch.cfloat, device=x.device)
+        out_ft[:, :, :mh, :mw] = self.compl_mul2d(x_ft[:, :, :mh, :mw], self.weights[:, :, :mh, :mw])
+        return torch.fft.irfft2(out_ft, s=(H, W))
+
+# fno2d
+class FNO2D(nn.Module):
+    def __init__(self, modes=MODES, width=WIDTH):
+        super().__init__()
+        self.relu = nn.ReLU()
+        self.fc0 = nn.Conv2d(3, width, 1, bias=False)
+
+        self.spec1 = SpectralConv2d(width, width, modes)
+        self.w1 = nn.Conv2d(width, width, 1, bias=False)
+        self.norm1 = nn.GroupNorm(16, width)
+
+        self.spec2 = SpectralConv2d(width, width, modes)
+        self.w2 = nn.Conv2d(width, width, 1, bias=False)
+        self.norm2 = nn.GroupNorm(16, width)
+
+        self.spec3 = SpectralConv2d(width, width, modes)
+        self.w3 = nn.Conv2d(width, width, 1, bias=False)
+        self.norm3 = nn.GroupNorm(16, width)
+
+        self.spec4 = SpectralConv2d(width, width, modes)
+        self.w4 = nn.Conv2d(width, width, 1, bias=False)
+        self.norm4 = nn.GroupNorm(16, width)
+
+        self.fc1 = nn.Conv2d(width, 32, 1, bias=False)
+        self.fc2 = nn.Conv2d(32, 1, 1, bias=False)
+
+    def forward(self, x):
+        x = self.fc0(x)
+        x = self.relu(self.norm1(self.spec1(x) + self.w1(x)))
+        x = self.relu(self.norm2(self.spec2(x) + self.w2(x)))
+        x = self.relu(self.norm3(self.spec3(x) + self.w3(x)))
+        x = self.relu(self.norm4(self.spec4(x) + self.w4(x)))
+        x = self.relu(self.fc1(x))
+        return self.fc2(x)
+
+# patch fx tracer
+QuantizationTracer = quantize_fx.prepare_qat_fx.__globals__["QuantizationTracer"]
+if not hasattr(QuantizationTracer, "_original_leaf"):
+    QuantizationTracer._original_leaf = QuantizationTracer.is_leaf_module
+    sig = inspect.signature(QuantizationTracer._original_leaf)
+    if len(sig.parameters) == 3:
+        def custom_is_leaf(self, module, module_qualified_name):
+            return isinstance(module, SpectralConv2d) or QuantizationTracer._original_leaf(self, module, module_qualified_name)
+    else:
+        def custom_is_leaf(self, module, module_qualified_name, graph, is_qat):
+            return isinstance(module, SpectralConv2d) or QuantizationTracer._original_leaf(self, module, module_qualified_name, graph, is_qat)
+    QuantizationTracer.is_leaf_module = custom_is_leaf
+
+# train and eval
+def train_and_eval(model, name, qat=False):
+    print(f"\n[Train] {name}")
+    model = model.to(device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+    loss_fn = nn.MSELoss()
+    for epoch in range(EPOCHS):
+        model.train()
+        total = 0
+        for xb, yb in train_loader:
+            xb, yb = xb.to(device), yb.to(device)
+            optimizer.zero_grad()
+            pred = model(xb)
+            loss = loss_fn(pred, yb)
+            loss.backward()
+            optimizer.step()
+            total += loss.item()
+        print(f"[{name} Epoch {epoch+1}] Loss: {total / len(train_loader):.6f}")
+    model.cpu().eval()
+
+    if qat:
+        with torch.no_grad():
+            for xb, _ in val_loader:
+                model(xb)
+                break
+        model = quantize_fx.convert_fx(model.eval())
+
+    total_err, total_time, total_samples = 0.0, 0.0, 0
+    with torch.no_grad():
+        for xb, yb in val_loader:
+            start = time.time()
+            pred = model(xb)
+            end = time.time()
+            batch = xb.size(0)
+            total_time += (end - start) * 1000
+            total_err += (torch.norm(pred - yb) / torch.norm(yb)).item()
+            total_samples += batch
+
+    print(f"\n[Summary] {name}")
+    print(f"Avg RelErr: {total_err / len(val_loader):.6f}")
+    print(f"Avg Time/sample: {total_time / total_samples:.4f} ms")
+    return total_err / len(val_loader), total_time / total_samples
+
+# float32 baseline
+float_model = FNO2D()
+float_err, float_time = train_and_eval(float_model, "Float32", qat=False)
+
+# qat prep
+print("\n[QAT] Preparing...")
+model_fp32 = FNO2D()
+example_inputs = (X[0:1],)
+qconfig = QConfig(activation=default_fake_quant, weight=default_weight_fake_quant)
+qmap = QConfigMapping().set_object_type(SpectralConv2d, None)
+qmap.set_module_name("fc0", qconfig)
+qmap.set_module_name("fc1", qconfig)
+qmap.set_module_name("fc2", qconfig)
+qat_model = quantize_fx.prepare_qat_fx(copy.deepcopy(model_fp32), qmap, example_inputs)
+
+# qat run
+qat_err, qat_time = train_and_eval(qat_model, "QAT INT8", qat=True)
+
+# final comparison
+print("\n=== Final Comparison ===")
+print(f"{'Model':<12} | {'Rel L2 Error':<15} | {'Time/sample (ms)':<15}")
+print("-" * 45)
+print(f"{'Float32':<12} | {float_err:<15.6f} | {float_time:<15.4f}")
+print(f"{'QAT INT8':<12} | {qat_err:<15.6f} | {qat_time:<15.4f}")
