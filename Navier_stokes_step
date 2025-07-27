@@ -8,8 +8,8 @@ import matplotlib.pyplot as plt # added for plotting
 torch.set_default_dtype(torch.float32) # all tensors are set to 32 bit precision
 
 # parameters
-nu = 5e-4        # viscosity set to 5 * 10^-4 (can try other values)
-delta_t = 0.02   # time step (can try other values)
+nu = 1e-4        # viscosity set to 5 * 10^-4 (can try other values)
+delta_t = 0.0208   # time step (can try other values)
 N = 32           # grid size is 32x32
 L = 2 * np.pi    # domain size, 0 to 2pi which is periodic for FFT
 
