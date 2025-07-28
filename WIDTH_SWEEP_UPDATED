@@ -1,169 +1,181 @@
 import torch
 import torch.nn as nn
-import torch.fft as fft
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, TensorDataset, random_split
-import matplotlib.pyplot as plt
+import torch.fft
 import time
-import pandas as pd
-import os
-from datetime import datetime
+import copy
+import inspect
+from torch.utils.data import DataLoader, TensorDataset, random_split
+import torch.ao.quantization.quantize_fx as quantize_fx
+from torch.ao.quantization import QConfigMapping
+from torch.ao.quantization.qconfig import QConfig
+from torch.ao.quantization.fake_quantize import default_fake_quant, default_weight_fake_quant
 
-# === FIXED BASE CONFIG ===
-base_config = {
-    'modes': 16,
-    'width': 96,
-    'epochs': 100,
-    'batch_size': 8,
-    'dt': 0.01,
-    'nu': 1e-3,
-    'grid_size': 32,
-    'train_samples': 9000,
-    'val_samples': 1000
-}
+# configurations
+torch.backends.quantized.engine = 'fbgemm'
+BATCH_SIZE = 256
+EVAL_BATCH_SIZE = 512
+TRAIN_SAMPLES = 9000
+VAL_SAMPLES = 1000
+MODES = 16
+WIDTH = 128
+EPOCHS = 500
+DT = 0.0208
+NU = 1e-4
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+# load data
+def augment_with_params(X, dt=DT, nu=NU):
+    B, _, H, W = X.shape
+    dt_channel = torch.full((B, 1, H, W), dt, dtype=X.dtype, device=X.device)
+    nu_channel = torch.full((B, 1, H, W), nu, dtype=X.dtype, device=X.device)
+    return torch.cat([X, dt_channel, nu_channel], dim=1)
+
+data = torch.load("synthetic_data_ns2d/synthetic_data.pt")
+X_raw = data[:TRAIN_SAMPLES + VAL_SAMPLES, 0].unsqueeze(1)
+Y = data[:TRAIN_SAMPLES + VAL_SAMPLES, 1].unsqueeze(1)
+X = augment_with_params(X_raw)
+train_set, val_set = random_split(TensorDataset(X, Y), [TRAIN_SAMPLES, VAL_SAMPLES])
+train_loader = DataLoader(train_set, batch_size=BATCH_SIZE, shuffle=True)
+val_loader = DataLoader(val_set, batch_size=EVAL_BATCH_SIZE)
+
+# spec conv2d
 class SpectralConv2d(nn.Module):
     def __init__(self, in_channels, out_channels, modes):
         super().__init__()
-        self.weights = nn.Parameter((1 / (in_channels * out_channels)) *
-                                    torch.rand(in_channels, out_channels, modes, modes, dtype=torch.cfloat))
-        self.modes = modes
+        self.weights = nn.Parameter(torch.randn(in_channels, out_channels, modes, modes, dtype=torch.cfloat))
 
     def compl_mul2d(self, input, weights):
-        return torch.einsum("bixy, ioxy -> boxy", input, weights)
+        return torch.einsum("bixy,ioxy->boxy", input, weights)
 
     def forward(self, x):
         B, C, H, W = x.shape
-        x_ft = fft.fft2(x, norm="ortho")
-        out_ft = torch.zeros(B, self.weights.shape[1], H, W, dtype=torch.cfloat, device=x.device)
-        out_ft[:, :, :self.modes, :self.modes] = self.compl_mul2d(x_ft[:, :, :self.modes, :self.modes], self.weights)
-        return fft.ifft2(out_ft, norm="ortho").real
+        x_ft = torch.fft.rfft2(x)
+        Hf, Wf = x_ft.shape[-2], x_ft.shape[-1]
+        mh, mw = self.weights.shape[-2:]
+        mh = min(mh, Hf)
+        mw = min(mw, Wf)
+        out_ft = torch.zeros(B, self.weights.size(1), Hf, Wf, dtype=torch.cfloat, device=x.device)
+        out_ft[:, :, :mh, :mw] = self.compl_mul2d(x_ft[:, :, :mh, :mw], self.weights[:, :, :mh, :mw])
+        return torch.fft.irfft2(out_ft, s=(H, W))
 
+# fno2d
 class FNO2D(nn.Module):
-    def __init__(self, modes, width):
+    def __init__(self, modes=MODES, width=WIDTH):
         super().__init__()
-        self.fc0 = nn.Linear(1, width)
-        self.conv1 = SpectralConv2d(width, width, modes)
-        self.conv2 = SpectralConv2d(width, width, modes)
-        self.w1 = nn.Conv2d(width, width, 1)
-        self.w2 = nn.Conv2d(width, width, 1)
-        self.fc1 = nn.Linear(width, 128)
-        self.fc2 = nn.Linear(128, 1)
+        self.fc0 = nn.Sequential(nn.Conv2d(3, width, 1, bias=False), nn.ReLU())  # fused
+        self.spec1 = SpectralConv2d(width, width, modes)
+        self.w1 = nn.Conv2d(width, width, 1, bias=False)
+        self.norm1 = nn.GroupNorm(16, width)
+        self.spec2 = SpectralConv2d(width, width, modes)
+        self.w2 = nn.Conv2d(width, width, 1, bias=False)
+        self.norm2 = nn.GroupNorm(16, width)
+        self.fc1 = nn.Sequential(nn.Conv2d(width, 32, 1, bias=False), nn.ReLU())  # fused
+        self.fc2 = nn.Conv2d(32, 1, 1, bias=False)
 
     def forward(self, x):
-        x = self.fc0(x.unsqueeze(-1)).permute(0, 3, 1, 2)
-        x = F.gelu(self.conv1(x) + self.w1(x))
-        x = F.gelu(self.conv2(x) + self.w2(x))
-        x = x.permute(0, 2, 3, 1)
-        return self.fc2(F.gelu(self.fc1(x))).squeeze(-1)
+        x = self.fc0(x)
+        x = self.norm1(self.spec1(x) + self.w1(x))
+        x = F.relu(x)
+        x = self.norm2(self.spec2(x) + self.w2(x))
+        x = F.relu(x)
+        x = self.fc1(x)
+        return self.fc2(x)
 
-def classification_error(pred, yb):
-    pred_classes = torch.round(pred)
-    true_classes = torch.round(yb)
-    num_correct = (pred_classes == true_classes).sum().item()
-    num_total = yb.numel()
-    return (num_total - num_correct) / num_total
+# fx tracer
+QuantizationTracer = quantize_fx.prepare_qat_fx.__globals__["QuantizationTracer"]
+if not hasattr(QuantizationTracer, "_original_leaf"):
+    QuantizationTracer._original_leaf = QuantizationTracer.is_leaf_module
+    sig = inspect.signature(QuantizationTracer._original_leaf)
+    if len(sig.parameters) == 3:
+        def custom_is_leaf(self, module, module_qualified_name):
+            return isinstance(module, SpectralConv2d) or QuantizationTracer._original_leaf(self, module, module_qualified_name)
+    else:
+        def custom_is_leaf(self, module, module_qualified_name, graph, is_qat):
+            return isinstance(module, SpectralConv2d) or QuantizationTracer._original_leaf(self, module, module_qualified_name, graph, is_qat)
+    QuantizationTracer.is_leaf_module = custom_is_leaf
 
-result_cache = {}
-
-def train_and_evaluate(config, device, log, param_name, val):
-    key = tuple(sorted(config.items()))
-    if key in result_cache:
-        return result_cache[key]
-
-    data = torch.load('synthetic_data_ns2d/synthetic_data.pt')
-    total_needed = config['train_samples'] + config['val_samples']
-    x_all, y_all = data[:total_needed, 0], data[:total_needed, 1]
-
-    dataset = TensorDataset(x_all, y_all)
-    generator = torch.Generator().manual_seed(42)
-    train_set, val_set = random_split(dataset, [config['train_samples'], config['val_samples']], generator=generator)
-    train_loader = DataLoader(train_set, batch_size=int(config['batch_size']), shuffle=True)
-    val_loader = DataLoader(val_set, batch_size=int(config['batch_size']), shuffle=False)
-
-    model = FNO2D(config['modes'], config['width']).to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+# train and eval
+def train_and_eval(model, name, qat=False):
+    print(f"\n[Train] {name}")
+    model = model.to(device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
     loss_fn = nn.MSELoss()
 
-    for ep in range(int(config['epochs'])):
+    for epoch in range(EPOCHS):
         model.train()
-        running_loss = 0.0
+        total = 0
         for xb, yb in train_loader:
             xb, yb = xb.to(device), yb.to(device)
             optimizer.zero_grad()
-            loss = loss_fn(model(xb), yb)
+            pred = model(xb)
+            loss = loss_fn(pred, yb)
             loss.backward()
             optimizer.step()
-            running_loss += loss.item()
+            total += loss.item()
+        print(f"[{name} Epoch {epoch+1}] Loss: {total / len(train_loader):.6f}")
 
-        epoch_log = f"Running: epoch {ep+1}/{int(config['epochs'])} | {param_name}={val}, grid={config['grid_size']}, loss={running_loss:.4f}\n"
-        print(epoch_log.strip())
-        log.write(epoch_log)
-        log.flush()
+    model.cpu().eval()
 
-    model.eval()
-    xb, yb = next(iter(val_loader))
-    xb, yb = xb.to(device), yb.to(device)
-    start = time.time()
+    if qat:
+        with torch.no_grad():
+            for xb, _ in val_loader:
+                model(xb)
+                break
+        torch.backends.quantized.engine = 'x86'
+        model = quantize_fx.convert_fx(model.eval())
+        model = model.cpu().eval()
+
+        # test quantized output manually 
+        with torch.no_grad():
+            x_sample = val_loader.dataset[0][0].unsqueeze(0)
+            y_pred = model(x_sample)
+            y_qint8 = torch.quantize_per_tensor(y_pred, scale=0.1, zero_point=0, dtype=torch.qint8)
+            print("\n[QAT INT8] Output test:")
+            print("Output dtype:", y_qint8.dtype)
+            # print("Quantized values:\n", y_qint8.int_repr())
+
+    total_err, total_time, total_samples = 0.0, 0.0, 0
     with torch.no_grad():
-        pred = model(xb)
-    end = time.time()
+        for xb, yb in val_loader:
+            start = time.time()
+            pred = model(xb)
+            end = time.time()
+            if qat:
+                pred = torch.quantize_per_tensor(pred, scale=0.1, zero_point=0, dtype=torch.qint8)
+            batch = xb.size(0)
+            total_time += (end - start) * 1000
+            total_err += (torch.norm(pred.dequantize() - yb) / torch.norm(yb)).item()
+            total_samples += batch
 
-    infer_time = (end - start) / len(xb)
-    rel_err = classification_error(pred, yb)
-    score = rel_err * (infer_time * 1000)
+    print(f"\n[Summary] {name}")
+    print(f"Avg RelErr: {total_err / len(val_loader):.6f}")
+    print(f"Avg Time/sample: {total_time / total_samples:.4f} ms")
+    return total_err / len(val_loader), total_time / total_samples
 
-    result_cache[key] = (rel_err, infer_time, score)
-    return rel_err, infer_time, score
+# float32 eval
+float_model = FNO2D()
+float_err, float_time = train_and_eval(float_model, "Float32", qat=False)
 
-def binary_search_param(param_name, param_values, out_dir, log):
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    left_val, right_val = float(min(param_values)), float(max(param_values))
-    iteration = 1
-    results = []
+# qat preparation
+print("\n[QAT] Preparing...")
+model_fp32 = FNO2D()
+example_inputs = (X[0:1],)
+qconfig = QConfig(activation=default_fake_quant, weight=default_weight_fake_quant)
+qmap = QConfigMapping().set_object_type(SpectralConv2d, None)
+qmap.set_module_name("fc0", qconfig)
+qmap.set_module_name("fc1", qconfig)
+qmap.set_module_name("fc2", qconfig)
+qmap.set_module_name("w1", qconfig)
+qmap.set_module_name("w2", qconfig)
+qat_model = quantize_fx.prepare_qat_fx(copy.deepcopy(model_fp32), qmap, example_inputs)
 
-    log.write(f"\n===== Binary Search on {param_name} =====\n")
-    while abs(right_val - left_val) > 1:
-        mid_val = (left_val + right_val) // 2
-        sweep_vals = [int(left_val), int(mid_val), int(right_val)]
-        log.write(f"[Iteration {iteration}] {param_name} values: {sweep_vals}\n")
-        print(f"[Iteration {iteration}] {param_name} values: {sweep_vals}")
-        iteration += 1
+# qat
+qat_err, qat_time = train_and_eval(qat_model, "QAT INT8", qat=True)
 
-        iter_results = []
-        for val in sweep_vals:
-            config = base_config.copy()
-            config[param_name] = val
-
-            rel_err, infer_time, score = train_and_evaluate(config, device, log, param_name, val)
-            log_line = f"    → {param_name}={val}, Rel Err={rel_err:.4e}, Time={infer_time:.4e}, Score={score:.4e}\n"
-            log.write(log_line)
-            print(log_line.strip())
-            results.append((val, rel_err, infer_time, score))
-            iter_results.append((val, score))
-
-        best_val = min(iter_results, key=lambda x: x[1])[0]
-        if best_val <= mid_val:
-            right_val = mid_val
-        else:
-            left_val = mid_val
-
-    os.makedirs(out_dir, exist_ok=True)
-    df = pd.DataFrame(results, columns=[param_name, 'Relative Error', 'Inference Time (s)', 'Score'])
-    csv_path = os.path.join(out_dir, f"{timestamp}_binarysearch_{param_name}.csv")
-    df.to_csv(csv_path, index=False)
-    log.write(f"\nSaved CSV to: {csv_path}\n")
-    print(f"Saved CSV to: {csv_path}\n")
-    print("Search complete. Check log and CSV for results.")
-
-# === MAIN EXECUTION ===
-sweep_param = 'width'
-sweep_range = [16, 256]
-
-output_dir = f"sweep_results/sweep_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-os.makedirs(output_dir, exist_ok=True)
-log_path = os.path.join(output_dir, "search_log.txt")
-
-with open(log_path, "w") as log_file:
-    binary_search_param(sweep_param, sweep_range, output_dir, log_file)
+# compare
+print("\n=== Final Comparison ===")
+print(f"{'Model':<12} | {'Rel L2 Error':<15} | {'Time/sample (ms)':<15}")
+print("-" * 45)
+print(f"{'Float32':<12} | {float_err:<15.6f} | {float_time:<15.4f}")
+print(f"{'QAT INT8':<12} | {qat_err:<15.6f} | {qat_time:<15.4f}")
